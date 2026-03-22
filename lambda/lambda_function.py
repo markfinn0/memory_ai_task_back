@@ -1,26 +1,89 @@
 import json
 import uuid
-import random
+import hashlib
 import base64
+import ssl
 import boto3
 import os
 from datetime import datetime
 from decimal import Decimal
+from urllib.request import Request, urlopen
+from urllib.error import HTTPError
 from boto3.dynamodb.conditions import Attr
 
-# DynamoDB setup
-dynamodb = boto3.resource("dynamodb", region_name=os.environ.get("AWS_REGION", "us-east-1"))
-TABLE_NAME = os.environ.get("DYNAMODB_TABLE", "document_tables_memory")
-table = dynamodb.Table(TABLE_NAME)
+# ---------------------------------------------------------------------------
+# AWS clients & config
+# ---------------------------------------------------------------------------
 
-# S3 setup
-s3 = boto3.client("s3", region_name=os.environ.get("AWS_REGION", "us-east-1"))
+REGION = os.environ.get("AWS_REGION", "us-east-1")
+
+dynamodb = boto3.resource("dynamodb", region_name=REGION)
+DOC_TABLE_NAME = os.environ.get("DYNAMODB_TABLE", "document_tables_memory")
+CHAT_TABLE_NAME = os.environ.get("CHAT_TABLE", "chat_memory_user")
+doc_table = dynamodb.Table(DOC_TABLE_NAME)
+chat_table = dynamodb.Table(CHAT_TABLE_NAME)
+
+s3 = boto3.client("s3", region_name=REGION)
 S3_BUCKET = os.environ.get("S3_BUCKET", "memoryaitest")
 
-# Delete password (set via environment variable)
 DELETE_PASSWORD = os.environ.get("DELETE_PASSWORD", "memory_ai_delete_2024")
 
-# ---------- helpers ----------
+# Gemini
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+GEMINI_EMBED_URL = "https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:embedContent"
+GEMINI_CHAT_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
+EMBEDDING_DIMENSIONS = 768
+
+# OpenSearch
+OPENSEARCH_ENDPOINT = os.environ.get(
+    "OPENSEARCH_ENDPOINT",
+    "https://search-memoryai-ebj55yqzcpswtjpb6lzmuknanu.us-east-1.es.amazonaws.com",
+)
+OPENSEARCH_INDEX = os.environ.get("OPENSEARCH_INDEX", "documents")
+
+# ElastiCache / Valkey (Redis-compatible, serverless with TLS)
+ELASTICACHE_HOST = os.environ.get(
+    "ELASTICACHE_HOST",
+    "memoryai-5ngs3u.serverless.use1.cache.amazonaws.com",
+)
+ELASTICACHE_PORT = int(os.environ.get("ELASTICACHE_PORT", "6379"))
+CACHE_TTL = int(os.environ.get("CACHE_TTL", "86400"))  # 1 day
+
+# ---------------------------------------------------------------------------
+# Lazy-initialised singletons
+# ---------------------------------------------------------------------------
+
+_redis_client = None
+
+
+def _get_redis():
+    """Return a Valkey/Redis client, or None if unavailable."""
+    global _redis_client
+    if _redis_client is not None:
+        return _redis_client
+    if not ELASTICACHE_HOST:
+        return None
+    try:
+        import redis as _redis_mod
+        _redis_client = _redis_mod.Redis(
+            host=ELASTICACHE_HOST,
+            port=ELASTICACHE_PORT,
+            decode_responses=True,
+            ssl=True,
+            socket_connect_timeout=3,
+            socket_timeout=3,
+        )
+        _redis_client.ping()
+        return _redis_client
+    except Exception as exc:
+        print(f"[cache] Valkey/Redis unavailable: {exc}")
+        _redis_client = None
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Generic helpers
+# ---------------------------------------------------------------------------
 
 CORS_HEADERS = {
     "Access-Control-Allow-Origin": "*",
@@ -39,7 +102,6 @@ def response(status_code: int, body: dict) -> dict:
 
 
 def convert_floats_to_decimal(obj):
-    """Convert float values to Decimal for DynamoDB storage."""
     if isinstance(obj, float):
         return Decimal(str(obj))
     if isinstance(obj, dict):
@@ -50,7 +112,6 @@ def convert_floats_to_decimal(obj):
 
 
 def convert_decimals_to_float(obj):
-    """Convert Decimal values back to float for API responses."""
     if isinstance(obj, Decimal):
         return float(obj)
     if isinstance(obj, dict):
@@ -58,9 +119,6 @@ def convert_decimals_to_float(obj):
     if isinstance(obj, list):
         return [convert_decimals_to_float(i) for i in obj]
     return obj
-
-
-# ---------- action handlers ----------
 
 
 MIME_MAP = {
@@ -75,39 +133,31 @@ MIME_MAP = {
     ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
 }
 
+_ssl_ctx = ssl.create_default_context()
+
+# ---------------------------------------------------------------------------
+# S3 helpers
+# ---------------------------------------------------------------------------
+
 
 def upload_file_to_s3(doc_id: str, file_data_url: str, file_type: str) -> str:
-    """Upload file data (base64 data URL) to S3 and return the S3 key."""
-    # Parse the data URL: "data:<mime>;base64,<data>"
     if "," in file_data_url:
         header, encoded = file_data_url.split(",", 1)
     else:
         encoded = file_data_url
         header = ""
-
     file_bytes = base64.b64decode(encoded)
-
-    # Determine content type from header or file extension
     content_type = "application/octet-stream"
     if header.startswith("data:"):
         content_type = header.split(":")[1].split(";")[0]
     else:
         content_type = MIME_MAP.get(file_type, content_type)
-
     s3_key = f"documents/{doc_id}/{doc_id}{file_type}"
-
-    s3.put_object(
-        Bucket=S3_BUCKET,
-        Key=s3_key,
-        Body=file_bytes,
-        ContentType=content_type,
-    )
-
+    s3.put_object(Bucket=S3_BUCKET, Key=s3_key, Body=file_bytes, ContentType=content_type)
     return s3_key
 
 
 def get_s3_presigned_url(s3_key: str, expires_in: int = 3600) -> str:
-    """Generate a presigned URL for an S3 object."""
     return s3.generate_presigned_url(
         "get_object",
         Params={"Bucket": S3_BUCKET, "Key": s3_key},
@@ -116,31 +166,280 @@ def get_s3_presigned_url(s3_key: str, expires_in: int = 3600) -> str:
 
 
 def delete_s3_file(s3_key: str) -> None:
-    """Delete a file from S3."""
     try:
         s3.delete_object(Bucket=S3_BUCKET, Key=s3_key)
     except Exception as e:
         print(f"Warning: Failed to delete S3 object {s3_key}: {e}")
 
 
+# ---------------------------------------------------------------------------
+# Gemini helpers
+# ---------------------------------------------------------------------------
+
+
+def generate_embedding(text: str) -> list:
+    """Call Gemini text-embedding-004 and return the vector (768-d)."""
+    if not GEMINI_API_KEY:
+        print("[embed] No GEMINI_API_KEY, returning empty vector")
+        return []
+    url = f"{GEMINI_EMBED_URL}?key={GEMINI_API_KEY}"
+    payload = json.dumps({
+        "model": "models/text-embedding-004",
+        "content": {"parts": [{"text": text[:8000]}]},
+    }).encode()
+    req = Request(url, data=payload, headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        with urlopen(req, timeout=15, context=_ssl_ctx) as resp:
+            data = json.loads(resp.read())
+        return data.get("embedding", {}).get("values", [])
+    except Exception as exc:
+        print(f"[embed] Gemini embedding error: {exc}")
+        return []
+
+
+def generate_ai_response(question: str, context_docs: list, chat_history: list) -> str:
+    """Call Gemini to generate a chat answer given context documents."""
+    if not GEMINI_API_KEY:
+        return (
+            f'I received your question: "{question}". '
+            "However, the AI service is not configured yet. "
+            "Please set the GEMINI_API_KEY environment variable."
+        )
+
+    ctx_parts = []
+    for i, doc in enumerate(context_docs, 1):
+        meta = doc.get("metadata", {})
+        ctx_parts.append(
+            f"--- Document {i}: {meta.get('fileName', 'unknown')} ---\n"
+            f"Author: {meta.get('author', 'N/A')}\n"
+            f"Context: {meta.get('context', 'N/A')}\n"
+            f"Content:\n{doc.get('content', '')[:3000]}\n"
+        )
+    context_block = "\n".join(ctx_parts) if ctx_parts else "No relevant documents found."
+
+    history_parts = []
+    for msg in chat_history[-10:]:
+        role = msg.get("role", "user")
+        prefix = "User" if role == "user" else "Assistant"
+        history_parts.append(f"{prefix}: {msg.get('content', '')}")
+    history_block = "\n".join(history_parts) if history_parts else ""
+
+    system_prompt = (
+        "You are a helpful AI assistant for the Memory AI system. "
+        "Answer the user's question based on the provided document context. "
+        "Be concise, accurate, and cite specific documents when possible. "
+        "If the context doesn't contain enough information, say so honestly.\n\n"
+        f"DOCUMENT CONTEXT:\n{context_block}\n"
+    )
+    if history_block:
+        system_prompt += f"\nCHAT HISTORY:\n{history_block}\n"
+
+    url = f"{GEMINI_CHAT_URL}?key={GEMINI_API_KEY}"
+    payload = json.dumps({
+        "contents": [
+            {"role": "user", "parts": [{"text": system_prompt + "\n\nQuestion: " + question}]},
+        ],
+        "generationConfig": {
+            "temperature": 0.7,
+            "maxOutputTokens": 1024,
+        },
+    }).encode()
+
+    req = Request(url, data=payload, headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        with urlopen(req, timeout=30, context=_ssl_ctx) as resp:
+            data = json.loads(resp.read())
+        candidates = data.get("candidates", [])
+        if candidates:
+            parts = candidates[0].get("content", {}).get("parts", [])
+            if parts:
+                return parts[0].get("text", "No response generated.")
+        return "No response generated by the AI model."
+    except Exception as exc:
+        print(f"[gemini] Chat error: {exc}")
+        return f"I encountered an error while processing your question. Error: {exc}"
+
+
+# ---------------------------------------------------------------------------
+# OpenSearch helpers
+# ---------------------------------------------------------------------------
+
+
+def _os_request(method: str, path: str, body: dict = None) -> dict:
+    """Make a signed request to OpenSearch using IAM (SigV4)."""
+    from botocore.auth import SigV4Auth
+    from botocore.awsrequest import AWSRequest
+    import botocore.session
+
+    url = f"{OPENSEARCH_ENDPOINT}/{path}"
+    data = json.dumps(body).encode() if body else None
+    headers = {"Content-Type": "application/json"}
+
+    session = botocore.session.get_session()
+    credentials = session.get_credentials()
+    if credentials is None:
+        print("[opensearch] No AWS credentials for SigV4")
+        return {}
+    frozen = credentials.get_frozen_credentials()
+    aws_req = AWSRequest(method=method, url=url, data=data, headers=headers)
+    SigV4Auth(frozen, "es", REGION).add_auth(aws_req)
+
+    req = Request(url, data=data, method=method)
+    for k, v in dict(aws_req.headers).items():
+        req.add_header(k, v)
+
+    try:
+        with urlopen(req, timeout=10, context=_ssl_ctx) as resp:
+            return json.loads(resp.read())
+    except HTTPError as exc:
+        body_bytes = exc.read() if hasattr(exc, "read") else b""
+        print(f"[opensearch] {method} {path} -> {exc.code}: {body_bytes[:500]}")
+        return {"error": True, "status": exc.code, "body": body_bytes.decode("utf-8", errors="replace")}
+    except Exception as exc:
+        print(f"[opensearch] {method} {path} error: {exc}")
+        return {"error": True, "message": str(exc)}
+
+
+_os_index_checked = False
+
+
+def ensure_opensearch_index():
+    """Create the OpenSearch index with kNN mapping if it does not exist."""
+    global _os_index_checked
+    if _os_index_checked:
+        return
+    result = _os_request("GET", OPENSEARCH_INDEX)
+    if result.get("error") and result.get("status") == 404:
+        mapping = {
+            "settings": {"index": {"knn": True}},
+            "mappings": {
+                "properties": {
+                    "doc_id": {"type": "keyword"},
+                    "content": {"type": "text"},
+                    "context": {"type": "text"},
+                    "file_name": {"type": "keyword"},
+                    "author": {"type": "keyword"},
+                    "tags": {"type": "keyword"},
+                    "embedding": {
+                        "type": "knn_vector",
+                        "dimension": EMBEDDING_DIMENSIONS,
+                        "method": {
+                            "name": "hnsw",
+                            "engine": "nmslib",
+                            "space_type": "cosinesimil",
+                        },
+                    },
+                    "created_at": {"type": "date"},
+                },
+            },
+        }
+        res = _os_request("PUT", OPENSEARCH_INDEX, mapping)
+        print(f"[opensearch] Index created: {res}")
+    _os_index_checked = True
+
+
+def index_document_opensearch(doc_id: str, content: str, embedding: list, metadata: dict):
+    """Index a document in OpenSearch for semantic search."""
+    if not embedding:
+        print(f"[opensearch] Skipping index for {doc_id}: no embedding")
+        return
+    ensure_opensearch_index()
+    body = {
+        "doc_id": doc_id,
+        "content": content[:10000],
+        "context": metadata.get("context", ""),
+        "file_name": metadata.get("fileName", ""),
+        "author": metadata.get("author", ""),
+        "tags": metadata.get("tags", []),
+        "embedding": embedding,
+        "created_at": datetime.utcnow().isoformat(),
+    }
+    result = _os_request("PUT", f"{OPENSEARCH_INDEX}/_doc/{doc_id}", body)
+    print(f"[opensearch] Indexed {doc_id}: {result.get('result', result)}")
+
+
+def delete_document_opensearch(doc_id: str):
+    """Remove a document from OpenSearch."""
+    _os_request("DELETE", f"{OPENSEARCH_INDEX}/_doc/{doc_id}")
+
+
+def semantic_search(query_embedding: list, k: int = 5) -> list:
+    """Perform kNN semantic search in OpenSearch."""
+    if not query_embedding:
+        return []
+    body = {
+        "size": k,
+        "query": {"knn": {"embedding": {"vector": query_embedding, "k": k}}},
+        "_source": ["doc_id", "content", "context", "file_name", "author", "tags"],
+    }
+    result = _os_request("POST", f"{OPENSEARCH_INDEX}/_search", body)
+    hits = result.get("hits", {}).get("hits", [])
+    docs = []
+    for hit in hits:
+        src = hit.get("_source", {})
+        docs.append({
+            "doc_id": src.get("doc_id"),
+            "content": src.get("content", ""),
+            "score": hit.get("_score", 0),
+            "metadata": {
+                "fileName": src.get("file_name", ""),
+                "author": src.get("author", ""),
+                "context": src.get("context", ""),
+                "tags": src.get("tags", []),
+            },
+        })
+    return docs
+
+
+# ---------------------------------------------------------------------------
+# ElastiCache / Valkey helpers
+# ---------------------------------------------------------------------------
+
+
+def _cache_key(question: str) -> str:
+    return "memoryai:answer:" + hashlib.sha256(question.strip().lower().encode()).hexdigest()
+
+
+def get_cached_response(question: str):
+    """Look up a cached AI response by question hash."""
+    rc = _get_redis()
+    if rc is None:
+        return None
+    try:
+        val = rc.get(_cache_key(question))
+        if val:
+            return json.loads(val)
+    except Exception as exc:
+        print(f"[cache] GET error: {exc}")
+    return None
+
+
+def cache_response(question: str, data: dict):
+    """Cache an AI response with TTL."""
+    rc = _get_redis()
+    if rc is None:
+        return
+    try:
+        rc.setex(_cache_key(question), CACHE_TTL, json.dumps(data, default=str))
+    except Exception as exc:
+        print(f"[cache] SET error: {exc}")
+
+
+# ---------------------------------------------------------------------------
+# Document actions
+# ---------------------------------------------------------------------------
+
+
 def get_upload_presigned_url(data: dict) -> dict:
-    """Generate a presigned PUT URL so the frontend can upload directly to S3."""
     file_type = data.get("fileType", ".txt")
     doc_id = data.get("docId") or str(uuid.uuid4())
-
     s3_key = f"documents/{doc_id}/{doc_id}{file_type}"
     content_type = MIME_MAP.get(file_type, "application/octet-stream")
-
     upload_url = s3.generate_presigned_url(
         "put_object",
-        Params={
-            "Bucket": S3_BUCKET,
-            "Key": s3_key,
-            "ContentType": content_type,
-        },
-        ExpiresIn=600,  # 10 minutes to upload
+        Params={"Bucket": S3_BUCKET, "Key": s3_key, "ContentType": content_type},
+        ExpiresIn=600,
     )
-
     return response(200, {
         "uploadUrl": upload_url,
         "s3Key": s3_key,
@@ -150,23 +449,27 @@ def get_upload_presigned_url(data: dict) -> dict:
 
 
 def upload_document(data: dict) -> dict:
-    """Store a document record in DynamoDB with file data in S3."""
+    """Upload document: save metadata to DynamoDB, generate embedding, index in OpenSearch."""
     required = ["fileName", "author", "context", "uploadedBy"]
     for field in required:
         if field not in data:
             return response(400, {"error": f"Missing required field: {field}"})
 
-    # Use the docId from presigned URL flow if provided, otherwise generate new
     doc_id = data.get("docId") or str(uuid.uuid4())
     now = datetime.utcnow().isoformat() + "Z"
     file_type = data.get("fileType", ".txt")
+    content = data.get("content", "")
 
-    # Build embedding info (mock for now, will be replaced with real embeddings)
+    # Generate real embedding via Gemini
+    embed_text = f"{data.get('context', '')} {data.get('fileName', '')} {content}"
+    vector = generate_embedding(embed_text)
+
     embedding = {
-        "model": "text-embedding-ada-002",
-        "dimensions": 1536,
-        "vector": [round(random.uniform(-1, 1), 6) for _ in range(10)],
-        "tokenCount": random.randint(50, 300),
+        "model": "text-embedding-004",
+        "dimensions": EMBEDDING_DIMENSIONS,
+        "vector": vector[:20] if vector else [],
+        "fullVectorSize": len(vector),
+        "tokenCount": len(embed_text.split()),
         "createdAt": now,
     }
 
@@ -184,82 +487,68 @@ def upload_document(data: dict) -> dict:
             "uploadedAt": now,
             "uploadedBy": data["uploadedBy"],
         },
-        "content": data.get("content", ""),
+        "content": content,
         "embedding": embedding,
         "createdAt": now,
     }
 
-    # If s3Key was provided (presigned URL upload flow), use it directly
     if "s3Key" in data and data["s3Key"]:
         item["s3Key"] = data["s3Key"]
         item["fileUrl"] = get_s3_presigned_url(data["s3Key"])
-    # Fallback: upload file via base64 data URL (for small files)
     elif "fileDataUrl" in data and data["fileDataUrl"]:
         s3_key = upload_file_to_s3(doc_id, data["fileDataUrl"], file_type)
         item["s3Key"] = s3_key
         item["fileUrl"] = get_s3_presigned_url(s3_key)
 
-    # Store optional delete password per document
     if data.get("deletePassword"):
         item["deletePassword"] = data["deletePassword"]
 
     item = convert_floats_to_decimal(item)
-    table.put_item(Item=item)
+    doc_table.put_item(Item=item)
+
+    # Index in OpenSearch (non-fatal if it fails)
+    try:
+        index_document_opensearch(doc_id, content, vector, data)
+    except Exception as exc:
+        print(f"[upload] OpenSearch indexing failed (non-fatal): {exc}")
 
     result = convert_decimals_to_float(item)
-    # Don't expose deletePassword in the response
     result.pop("deletePassword", None)
     return response(201, {"message": "Document uploaded successfully", "document": result})
 
 
 def get_documents(data: dict) -> dict:
-    """List all documents from DynamoDB."""
-    scan_kwargs = {
-        "FilterExpression": Attr("record_type").eq("document"),
-    }
-
+    scan_kwargs = {"FilterExpression": Attr("record_type").eq("document")}
     items = []
-    done = False
     start_key = None
-
-    while not done:
+    while True:
         if start_key:
             scan_kwargs["ExclusiveStartKey"] = start_key
-        resp = table.scan(**scan_kwargs)
+        resp = doc_table.scan(**scan_kwargs)
         items.extend(resp.get("Items", []))
-        start_key = resp.get("LastEvaluatedKey", None)
-        done = start_key is None
-
-    # Sort by createdAt descending
+        start_key = resp.get("LastEvaluatedKey")
+        if not start_key:
+            break
     items.sort(key=lambda x: x.get("createdAt", ""), reverse=True)
-
-    # Generate fresh presigned URLs for documents with S3 keys
     for item in items:
         if "s3Key" in item:
             item["fileUrl"] = get_s3_presigned_url(item["s3Key"])
         item["hasDeletePassword"] = bool(item.get("deletePassword"))
         item.pop("deletePassword", None)
-
     items = convert_decimals_to_float(items)
     return response(200, {"documents": items, "count": len(items)})
 
 
 def get_document(data: dict) -> dict:
-    """Get a single document by ID."""
     doc_id = data.get("documentId")
     if not doc_id:
         return response(400, {"error": "Missing required field: documentId"})
-
-    resp = table.get_item(Key={"ID": doc_id})
+    resp = doc_table.get_item(Key={"ID": doc_id})
     item = resp.get("Item")
-
     if not item or item.get("record_type") != "document":
         return response(404, {"error": "Document not found"})
-
-    # Generate a fresh presigned URL if the document has an S3 key
     if "s3Key" in item:
         item["fileUrl"] = get_s3_presigned_url(item["s3Key"])
-
     item["hasDeletePassword"] = bool(item.get("deletePassword"))
     item.pop("deletePassword", None)
     item = convert_decimals_to_float(item)
@@ -267,30 +556,45 @@ def get_document(data: dict) -> dict:
 
 
 def search_documents(data: dict) -> dict:
-    """Search documents by query string across name, author, context, tags, content."""
     query = data.get("query", "").lower().strip()
     if not query:
         return get_documents(data)
 
-    # Get all documents first, then filter in memory
-    # (For production, use DynamoDB GSI or Elasticsearch)
-    scan_kwargs = {
-        "FilterExpression": Attr("record_type").eq("document"),
-    }
+    # Try semantic search first via OpenSearch
+    query_vec = generate_embedding(query)
+    if query_vec:
+        os_hits = semantic_search(query_vec, k=10)
+        if os_hits:
+            results = []
+            for hit in os_hits:
+                did = hit.get("doc_id")
+                if not did:
+                    continue
+                r = doc_table.get_item(Key={"ID": did})
+                item = r.get("Item")
+                if item and item.get("record_type") == "document":
+                    if "s3Key" in item:
+                        item["fileUrl"] = get_s3_presigned_url(item["s3Key"])
+                    item["hasDeletePassword"] = bool(item.get("deletePassword"))
+                    item.pop("deletePassword", None)
+                    item["searchScore"] = hit.get("score", 0)
+                    results.append(item)
+            if results:
+                results = convert_decimals_to_float(results)
+                return response(200, {"documents": results, "count": len(results), "searchType": "semantic"})
 
+    # Fallback: text search in DynamoDB
+    scan_kwargs = {"FilterExpression": Attr("record_type").eq("document")}
     items = []
-    done = False
     start_key = None
-
-    while not done:
+    while True:
         if start_key:
             scan_kwargs["ExclusiveStartKey"] = start_key
-        resp = table.scan(**scan_kwargs)
+        resp = doc_table.scan(**scan_kwargs)
         items.extend(resp.get("Items", []))
-        start_key = resp.get("LastEvaluatedKey", None)
-        done = start_key is None
-
-    # Filter by query
+        start_key = resp.get("LastEvaluatedKey")
+        if not start_key:
+            break
     filtered = []
     for item in items:
         meta = item.get("metadata", {})
@@ -303,31 +607,57 @@ def search_documents(data: dict) -> dict:
         ]).lower()
         if query in searchable:
             filtered.append(item)
-
     filtered.sort(key=lambda x: x.get("createdAt", ""), reverse=True)
-
-    # Generate fresh presigned URLs for documents with S3 keys
     for item in filtered:
         if "s3Key" in item:
             item["fileUrl"] = get_s3_presigned_url(item["s3Key"])
         item["hasDeletePassword"] = bool(item.get("deletePassword"))
         item.pop("deletePassword", None)
-
     filtered = convert_decimals_to_float(filtered)
-    return response(200, {"documents": filtered, "count": len(filtered)})
+    return response(200, {"documents": filtered, "count": len(filtered), "searchType": "keyword"})
+
+
+def delete_document(data: dict) -> dict:
+    doc_id = data.get("documentId")
+    password = data.get("password")
+    if not doc_id:
+        return response(400, {"error": "Missing required field: documentId"})
+    if not password:
+        return response(400, {"error": "Missing required field: password"})
+    resp = doc_table.get_item(Key={"ID": doc_id})
+    item = resp.get("Item")
+    if not item or item.get("record_type") != "document":
+        return response(404, {"error": "Document not found"})
+    doc_password = item.get("deletePassword")
+    if doc_password:
+        if password != doc_password:
+            return response(403, {"error": "Invalid password"})
+    else:
+        if password != DELETE_PASSWORD:
+            return response(403, {"error": "Invalid password"})
+    if "s3Key" in item:
+        delete_s3_file(item["s3Key"])
+    doc_table.delete_item(Key={"ID": doc_id})
+    try:
+        delete_document_opensearch(doc_id)
+    except Exception as exc:
+        print(f"[delete] OpenSearch removal failed (non-fatal): {exc}")
+    return response(200, {"message": "Document deleted successfully", "documentId": doc_id})
+
+
+# ---------------------------------------------------------------------------
+# Chat actions  (uses chat_memory_user table)
+# ---------------------------------------------------------------------------
 
 
 def create_chat(data: dict) -> dict:
-    """Create a new chat session."""
     required = ["title", "createdBy"]
     for field in required:
         if field not in data:
             return response(400, {"error": f"Missing required field: {field}"})
-
     chat_id = str(uuid.uuid4())
     now = datetime.utcnow().isoformat() + "Z"
     author_token = str(uuid.uuid4())
-
     item = {
         "ID": chat_id,
         "record_type": "chat",
@@ -338,91 +668,65 @@ def create_chat(data: dict) -> dict:
         "isPublic": True,
         "messages": [],
     }
-
-    table.put_item(Item=item)
-
-    return response(201, {
-        "message": "Chat created successfully",
-        "chat": convert_decimals_to_float(item),
-    })
+    chat_table.put_item(Item=item)
+    return response(201, {"message": "Chat created successfully", "chat": convert_decimals_to_float(item)})
 
 
 def get_chats(data: dict) -> dict:
-    """List all chat sessions."""
-    scan_kwargs = {
-        "FilterExpression": Attr("record_type").eq("chat"),
-    }
-
+    scan_kwargs = {"FilterExpression": Attr("record_type").eq("chat")}
     items = []
-    done = False
     start_key = None
-
-    while not done:
+    while True:
         if start_key:
             scan_kwargs["ExclusiveStartKey"] = start_key
-        resp = table.scan(**scan_kwargs)
+        resp = chat_table.scan(**scan_kwargs)
         items.extend(resp.get("Items", []))
-        start_key = resp.get("LastEvaluatedKey", None)
-        done = start_key is None
-
+        start_key = resp.get("LastEvaluatedKey")
+        if not start_key:
+            break
     items.sort(key=lambda x: x.get("createdAt", ""), reverse=True)
-
-    # Remove authorToken from public listing for security
     safe_items = []
     for item in items:
         safe_item = {k: v for k, v in item.items() if k != "authorToken"}
         safe_item["messageCount"] = len(item.get("messages", []))
         safe_items.append(safe_item)
-
     safe_items = convert_decimals_to_float(safe_items)
     return response(200, {"chats": safe_items, "count": len(safe_items)})
 
 
 def get_chat(data: dict) -> dict:
-    """Get a single chat session by ID."""
     chat_id = data.get("chatId")
     if not chat_id:
         return response(400, {"error": "Missing required field: chatId"})
-
-    resp = table.get_item(Key={"ID": chat_id})
+    resp = chat_table.get_item(Key={"ID": chat_id})
     item = resp.get("Item")
-
     if not item or item.get("record_type") != "chat":
         return response(404, {"error": "Chat not found"})
-
-    # Include authorToken so frontend can compare with cookie
     item = convert_decimals_to_float(item)
     return response(200, {"chat": item})
 
 
 def send_message(data: dict) -> dict:
-    """Send a message in a chat and get AI response."""
+    """Memory-augmented chat: cache -> semantic search -> Gemini -> cache."""
     chat_id = data.get("chatId")
     message_content = data.get("message")
     author_token = data.get("authorToken")
-
     if not chat_id:
         return response(400, {"error": "Missing required field: chatId"})
     if not message_content:
         return response(400, {"error": "Missing required field: message"})
     if not author_token:
         return response(400, {"error": "Missing required field: authorToken"})
-
-    # Get the chat
-    resp = table.get_item(Key={"ID": chat_id})
+    resp = chat_table.get_item(Key={"ID": chat_id})
     item = resp.get("Item")
-
     if not item or item.get("record_type") != "chat":
         return response(404, {"error": "Chat not found"})
-
-    # Verify author
     if item.get("authorToken") != author_token:
         return response(403, {"error": "Only the chat author can send messages"})
 
     now = datetime.utcnow().isoformat() + "Z"
     messages = item.get("messages", [])
 
-    # Add user message
     user_msg = {
         "id": str(uuid.uuid4()),
         "role": "user",
@@ -431,19 +735,59 @@ def send_message(data: dict) -> dict:
     }
     messages.append(user_msg)
 
-    # Generate mock AI response
-    ai_response = generate_mock_ai_response(message_content)
+    # ---- Memory pipeline ----
+    source_type = "new"
+    confidence = 0.0
+    documents_used = []
+    cached = False
+
+    # Step 1: Check ElastiCache / Valkey
+    cached_resp = get_cached_response(message_content)
+    if cached_resp:
+        ai_content = cached_resp["content"]
+        source_type = "reused"
+        confidence = cached_resp.get("confidence", 0.95)
+        documents_used = cached_resp.get("documentsUsed", [])
+        cached = True
+        print("[chat] Cache HIT for question hash")
+    else:
+        # Step 2: Semantic search in OpenSearch
+        query_vec = generate_embedding(message_content)
+        context_docs = semantic_search(query_vec, k=5) if query_vec else []
+        documents_used = [d.get("doc_id", "") for d in context_docs if d.get("doc_id")]
+
+        if context_docs:
+            max_score = max(d.get("score", 0) for d in context_docs)
+            confidence = round(min(max_score, 1.0), 4)
+        else:
+            confidence = 0.5
+
+        # Step 3: Generate answer via Gemini
+        ai_content = generate_ai_response(message_content, context_docs, messages[:-1])
+
+        # Step 4: Cache the response
+        cache_response(message_content, {
+            "content": ai_content,
+            "confidence": confidence,
+            "documentsUsed": documents_used,
+        })
+        print("[chat] Cache MISS - generated new response, cached it")
+
     ai_msg = {
         "id": str(uuid.uuid4()),
         "role": "assistant",
-        "content": ai_response["content"],
+        "content": ai_content,
         "timestamp": datetime.utcnow().isoformat() + "Z",
-        "source": ai_response["source"],
+        "source": {
+            "type": source_type,
+            "confidence": confidence,
+            "documentsUsed": documents_used,
+            "cached": cached,
+        },
     }
     messages.append(ai_msg)
 
-    # Update chat in DynamoDB
-    table.update_item(
+    chat_table.update_item(
         Key={"ID": chat_id},
         UpdateExpression="SET messages = :msgs",
         ExpressionAttributeValues={":msgs": convert_floats_to_decimal(messages)},
@@ -455,128 +799,26 @@ def send_message(data: dict) -> dict:
     })
 
 
-def generate_mock_ai_response(user_message: str) -> dict:
-    """Generate a mock AI response based on keywords in the user message.
-
-    This will be replaced with real AI integration (e.g., Bedrock, OpenAI) later.
-    """
-    lower_msg = user_message.lower()
-
-    responses = {
-        "revenue": {
-            "content": "Based on the quarterly report, the revenue for Q4 2025 was $4.2M, which represents a 15% year-over-year growth. Cloud services revenue specifically grew by 28%.",
-            "source": {
-                "type": "reused",
-                "confidence": 0.92,
-                "originalChatId": None,
-            },
-        },
-        "projection": {
-            "content": "The projections for 2026 include expected revenue growth of 20-25%, planned expansion into European markets, and a new product line launch in Q2.",
-            "source": {
-                "type": "reused",
-                "confidence": 0.90,
-                "originalChatId": None,
-            },
-        },
-        "feedback": {
-            "content": "The main customer complaints revolve around performance issues, particularly loading times. Positive feedback highlights the new dashboard design and export feature.",
-            "source": {
-                "type": "reused",
-                "confidence": 0.88,
-                "originalChatId": None,
-            },
-        },
-        "api": {
-            "content": "The Memory Management API v2.0 has several endpoints including POST /documents for uploads, GET /documents/:id for retrieval, and POST /chat for AI interaction. Rate limits are 100 requests per minute and 10 document uploads per hour.",
-            "source": {
-                "type": "new",
-                "confidence": 0.85,
-                "documentsUsed": [],
-            },
-        },
-    }
-
-    for keyword, resp in responses.items():
-        if keyword in lower_msg:
-            return resp
-
-    return {
-        "content": f'I\'ve analyzed your question: "{user_message}". Based on the available documents and previous conversations, here is a synthesized response. This is a new analysis that hasn\'t been generated before, drawing from multiple sources in the knowledge base.',
-        "source": {
-            "type": "new",
-            "confidence": 0.75,
-            "documentsUsed": [],
-        },
-    }
-
-
-def delete_document(data: dict) -> dict:
-    """Delete a document by ID (requires password).
-
-    Uses the per-document password if one was set at upload time,
-    otherwise falls back to the global DELETE_PASSWORD.
-    """
-    doc_id = data.get("documentId")
-    password = data.get("password")
-
-    if not doc_id:
-        return response(400, {"error": "Missing required field: documentId"})
-    if not password:
-        return response(400, {"error": "Missing required field: password"})
-
-    # Get document to find S3 key and password before deleting
-    resp = table.get_item(Key={"ID": doc_id})
-    item = resp.get("Item")
-
-    if not item or item.get("record_type") != "document":
-        return response(404, {"error": "Document not found"})
-
-    # Check password: per-document password takes priority, then global
-    doc_password = item.get("deletePassword")
-    if doc_password:
-        if password != doc_password:
-            return response(403, {"error": "Invalid password"})
-    else:
-        if password != DELETE_PASSWORD:
-            return response(403, {"error": "Invalid password"})
-
-    # Delete file from S3 if it exists
-    if "s3Key" in item:
-        delete_s3_file(item["s3Key"])
-
-    # Delete from DynamoDB
-    table.delete_item(Key={"ID": doc_id})
-
-    return response(200, {"message": "Document deleted successfully", "documentId": doc_id})
-
-
 def delete_chat(data: dict) -> dict:
-    """Delete a chat session by ID (requires password)."""
     chat_id = data.get("chatId")
     password = data.get("password")
-
     if not chat_id:
         return response(400, {"error": "Missing required field: chatId"})
     if not password:
         return response(400, {"error": "Missing required field: password"})
     if password != DELETE_PASSWORD:
         return response(403, {"error": "Invalid password"})
-
-    # Verify the chat exists
-    resp = table.get_item(Key={"ID": chat_id})
+    resp = chat_table.get_item(Key={"ID": chat_id})
     item = resp.get("Item")
-
     if not item or item.get("record_type") != "chat":
         return response(404, {"error": "Chat not found"})
-
-    # Delete from DynamoDB
-    table.delete_item(Key={"ID": chat_id})
-
+    chat_table.delete_item(Key={"ID": chat_id})
     return response(200, {"message": "Chat deleted successfully", "chatId": chat_id})
 
 
-# ---------- action router ----------
+# ---------------------------------------------------------------------------
+# Action router
+# ---------------------------------------------------------------------------
 
 ACTION_MAP = {
     "get_upload_url": get_upload_presigned_url,
@@ -594,36 +836,26 @@ ACTION_MAP = {
 
 
 def lambda_handler(event, context):
-    """Main Lambda handler - routes to action functions based on request body."""
-
-    # Handle CORS preflight
     if event.get("httpMethod") == "OPTIONS":
         return response(200, {"message": "OK"})
-
     try:
-        # Parse body
         body = event.get("body", "{}")
         if isinstance(body, str):
             body = json.loads(body)
-
         action = body.get("action")
         if not action:
             return response(400, {
                 "error": "Missing 'action' field in request body",
                 "available_actions": list(ACTION_MAP.keys()),
             })
-
         handler = ACTION_MAP.get(action)
         if not handler:
             return response(400, {
                 "error": f"Unknown action: {action}",
                 "available_actions": list(ACTION_MAP.keys()),
             })
-
-        # Pass the data (everything except action) to the handler
         data = {k: v for k, v in body.items() if k != "action"}
         return handler(data)
-
     except json.JSONDecodeError:
         return response(400, {"error": "Invalid JSON in request body"})
     except Exception as e:
