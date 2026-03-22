@@ -695,9 +695,9 @@ def get_chats(data: dict) -> dict:
 
 
 def get_chat(data: dict) -> dict:
-    chat_id = data.get("chatId")
+    chat_id = data.get("chatid")
     if not chat_id:
-        return response(400, {"error": "Missing required field: chatId"})
+        return response(400, {"error": "Missing required field: chatid"})
     resp = chat_table.get_item(Key={"ID": chat_id})
     item = resp.get("Item")
     if not item or item.get("record_type") != "chat":
@@ -708,11 +708,11 @@ def get_chat(data: dict) -> dict:
 
 def send_message(data: dict) -> dict:
     """Memory-augmented chat: cache -> semantic search -> Gemini -> cache."""
-    chat_id = data.get("chatId")
+    chat_id = data.get("chatid")
     message_content = data.get("message")
     author_token = data.get("authorToken")
     if not chat_id:
-        return response(400, {"error": "Missing required field: chatId"})
+        return response(400, {"error": "Missing required field: chatid"})
     if not message_content:
         return response(400, {"error": "Missing required field: message"})
     if not author_token:
@@ -800,10 +800,10 @@ def send_message(data: dict) -> dict:
 
 
 def delete_chat(data: dict) -> dict:
-    chat_id = data.get("chatId")
+    chat_id = data.get("chatid")
     password = data.get("password")
     if not chat_id:
-        return response(400, {"error": "Missing required field: chatId"})
+        return response(400, {"error": "Missing required field: chatid"})
     if not password:
         return response(400, {"error": "Missing required field: password"})
     if password != DELETE_PASSWORD:
