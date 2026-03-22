@@ -30,7 +30,7 @@ DELETE_PASSWORD = os.environ.get("DELETE_PASSWORD", "memory_ai_delete_2024")
 
 # Gemini
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-GEMINI_EMBED_URL = "https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:embedContent"
+GEMINI_EMBED_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-001:embedContent"
 GEMINI_CHAT_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
 EMBEDDING_DIMENSIONS = 768
 
@@ -178,14 +178,14 @@ def delete_s3_file(s3_key: str) -> None:
 
 
 def generate_embedding(text: str) -> list:
-    """Call Gemini text-embedding-004 and return the vector (768-d)."""
+    """Call Gemini gemini-embedding-001 and return a 768-d vector."""
     if not GEMINI_API_KEY:
         print("[embed] No GEMINI_API_KEY, returning empty vector")
         return []
     url = f"{GEMINI_EMBED_URL}?key={GEMINI_API_KEY}"
     payload = json.dumps({
-        "model": "models/text-embedding-004",
         "content": {"parts": [{"text": text[:8000]}]},
+        "outputDimensionality": EMBEDDING_DIMENSIONS,
     }).encode()
     req = Request(url, data=payload, headers={"Content-Type": "application/json"}, method="POST")
     try:
