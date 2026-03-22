@@ -1,5 +1,6 @@
 import json
 import uuid
+import random
 import boto3
 import os
 from datetime import datetime
@@ -27,13 +28,6 @@ def response(status_code: int, body: dict) -> dict:
         "headers": CORS_HEADERS,
         "body": json.dumps(body, default=str),
     }
-
-
-def decimal_default(obj):
-    """Convert Decimal objects to float for JSON serialization."""
-    if isinstance(obj, Decimal):
-        return float(obj)
-    raise TypeError(f"Object of type {type(obj)} is not JSON serializable")
 
 
 def convert_floats_to_decimal(obj):
@@ -72,8 +66,6 @@ def upload_document(data: dict) -> dict:
     now = datetime.utcnow().isoformat() + "Z"
 
     # Build embedding info (mock for now, will be replaced with real embeddings)
-    import random
-
     embedding = {
         "model": "text-embedding-ada-002",
         "dimensions": 1536,
