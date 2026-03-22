@@ -63,6 +63,19 @@ def convert_decimals_to_float(obj):
 # ---------- action handlers ----------
 
 
+MIME_MAP = {
+    ".pdf": "application/pdf",
+    ".csv": "text/csv",
+    ".txt": "text/plain",
+    ".json": "application/json",
+    ".xml": "application/xml",
+    ".doc": "application/msword",
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".xls": "application/vnd.ms-excel",
+    ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+}
+
+
 def upload_file_to_s3(doc_id: str, file_data_url: str, file_type: str) -> str:
     """Upload file data (base64 data URL) to S3 and return the S3 key."""
     # Parse the data URL: "data:<mime>;base64,<data>"
@@ -79,18 +92,7 @@ def upload_file_to_s3(doc_id: str, file_data_url: str, file_type: str) -> str:
     if header.startswith("data:"):
         content_type = header.split(":")[1].split(";")[0]
     else:
-        mime_map = {
-            ".pdf": "application/pdf",
-            ".csv": "text/csv",
-            ".txt": "text/plain",
-            ".json": "application/json",
-            ".xml": "application/xml",
-            ".doc": "application/msword",
-            ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            ".xls": "application/vnd.ms-excel",
-            ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        }
-        content_type = mime_map.get(file_type, content_type)
+        content_type = MIME_MAP.get(file_type, content_type)
 
     s3_key = f"documents/{doc_id}/{doc_id}{file_type}"
 
@@ -121,6 +123,32 @@ def delete_s3_file(s3_key: str) -> None:
         print(f"Warning: Failed to delete S3 object {s3_key}: {e}")
 
 
+def get_upload_presigned_url(data: dict) -> dict:
+    """Generate a presigned PUT URL so the frontend can upload directly to S3."""
+    file_type = data.get("fileType", ".txt")
+    doc_id = data.get("docId") or str(uuid.uuid4())
+
+    s3_key = f"documents/{doc_id}/{doc_id}{file_type}"
+    content_type = MIME_MAP.get(file_type, "application/octet-stream")
+
+    upload_url = s3.generate_presigned_url(
+        "put_object",
+        Params={
+            "Bucket": S3_BUCKET,
+            "Key": s3_key,
+            "ContentType": content_type,
+        },
+        ExpiresIn=600,  # 10 minutes to upload
+    )
+
+    return response(200, {
+        "uploadUrl": upload_url,
+        "s3Key": s3_key,
+        "docId": doc_id,
+        "contentType": content_type,
+    })
+
+
 def upload_document(data: dict) -> dict:
     """Store a document record in DynamoDB with file data in S3."""
     required = ["fileName", "author", "context", "uploadedBy"]
@@ -128,7 +156,8 @@ def upload_document(data: dict) -> dict:
         if field not in data:
             return response(400, {"error": f"Missing required field: {field}"})
 
-    doc_id = str(uuid.uuid4())
+    # Use the docId from presigned URL flow if provided, otherwise generate new
+    doc_id = data.get("docId") or str(uuid.uuid4())
     now = datetime.utcnow().isoformat() + "Z"
     file_type = data.get("fileType", ".txt")
 
@@ -160,17 +189,26 @@ def upload_document(data: dict) -> dict:
         "createdAt": now,
     }
 
-    # Upload file to S3 if fileDataUrl is provided
-    if "fileDataUrl" in data and data["fileDataUrl"]:
+    # If s3Key was provided (presigned URL upload flow), use it directly
+    if "s3Key" in data and data["s3Key"]:
+        item["s3Key"] = data["s3Key"]
+        item["fileUrl"] = get_s3_presigned_url(data["s3Key"])
+    # Fallback: upload file via base64 data URL (for small files)
+    elif "fileDataUrl" in data and data["fileDataUrl"]:
         s3_key = upload_file_to_s3(doc_id, data["fileDataUrl"], file_type)
         item["s3Key"] = s3_key
-        # Generate a presigned URL for immediate access
         item["fileUrl"] = get_s3_presigned_url(s3_key)
+
+    # Store optional delete password per document
+    if data.get("deletePassword"):
+        item["deletePassword"] = data["deletePassword"]
 
     item = convert_floats_to_decimal(item)
     table.put_item(Item=item)
 
     result = convert_decimals_to_float(item)
+    # Don't expose deletePassword in the response
+    result.pop("deletePassword", None)
     return response(201, {"message": "Document uploaded successfully", "document": result})
 
 
@@ -199,6 +237,8 @@ def get_documents(data: dict) -> dict:
     for item in items:
         if "s3Key" in item:
             item["fileUrl"] = get_s3_presigned_url(item["s3Key"])
+        item["hasDeletePassword"] = bool(item.get("deletePassword"))
+        item.pop("deletePassword", None)
 
     items = convert_decimals_to_float(items)
     return response(200, {"documents": items, "count": len(items)})
@@ -220,6 +260,8 @@ def get_document(data: dict) -> dict:
     if "s3Key" in item:
         item["fileUrl"] = get_s3_presigned_url(item["s3Key"])
 
+    item["hasDeletePassword"] = bool(item.get("deletePassword"))
+    item.pop("deletePassword", None)
     item = convert_decimals_to_float(item)
     return response(200, {"document": item})
 
@@ -268,6 +310,8 @@ def search_documents(data: dict) -> dict:
     for item in filtered:
         if "s3Key" in item:
             item["fileUrl"] = get_s3_presigned_url(item["s3Key"])
+        item["hasDeletePassword"] = bool(item.get("deletePassword"))
+        item.pop("deletePassword", None)
 
     filtered = convert_decimals_to_float(filtered)
     return response(200, {"documents": filtered, "count": len(filtered)})
@@ -468,7 +512,11 @@ def generate_mock_ai_response(user_message: str) -> dict:
 
 
 def delete_document(data: dict) -> dict:
-    """Delete a document by ID (requires password)."""
+    """Delete a document by ID (requires password).
+
+    Uses the per-document password if one was set at upload time,
+    otherwise falls back to the global DELETE_PASSWORD.
+    """
     doc_id = data.get("documentId")
     password = data.get("password")
 
@@ -476,15 +524,22 @@ def delete_document(data: dict) -> dict:
         return response(400, {"error": "Missing required field: documentId"})
     if not password:
         return response(400, {"error": "Missing required field: password"})
-    if password != DELETE_PASSWORD:
-        return response(403, {"error": "Invalid password"})
 
-    # Get document to find S3 key before deleting
+    # Get document to find S3 key and password before deleting
     resp = table.get_item(Key={"ID": doc_id})
     item = resp.get("Item")
 
     if not item or item.get("record_type") != "document":
         return response(404, {"error": "Document not found"})
+
+    # Check password: per-document password takes priority, then global
+    doc_password = item.get("deletePassword")
+    if doc_password:
+        if password != doc_password:
+            return response(403, {"error": "Invalid password"})
+    else:
+        if password != DELETE_PASSWORD:
+            return response(403, {"error": "Invalid password"})
 
     # Delete file from S3 if it exists
     if "s3Key" in item:
@@ -524,6 +579,7 @@ def delete_chat(data: dict) -> dict:
 # ---------- action router ----------
 
 ACTION_MAP = {
+    "get_upload_url": get_upload_presigned_url,
     "upload_document": upload_document,
     "get_documents": get_documents,
     "get_document": get_document,
