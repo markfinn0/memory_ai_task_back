@@ -7,6 +7,7 @@ AWS Lambda function that serves as the backend for the Memory AI POC application
 - **AWS Lambda** - Single function handling all application logic
 - **API Gateway** - Single POST route `/interaction` that invokes the Lambda
 - **DynamoDB** - Table `document_tables_memory` with partition key `ID` (UUID)
+- **S3** - Bucket `memoryaitest` for file storage (PDFs, CSVs, etc.)
 
 ## API
 
@@ -26,6 +27,8 @@ All requests go to the same endpoint. The `action` field in the request body det
 | `get_chats` | List all chat sessions |
 | `get_chat` | Get a single chat with messages |
 | `send_message` | Send a message and get AI response |
+| `delete_document` | Delete a document (requires password) |
+| `delete_chat` | Delete a chat session (requires password) |
 
 ### Request Examples
 
@@ -102,6 +105,24 @@ All requests go to the same endpoint. The `action` field in the request body det
 }
 ```
 
+#### Delete Document
+```json
+{
+  "action": "delete_document",
+  "documentId": "uuid-here",
+  "password": "your-delete-password"
+}
+```
+
+#### Delete Chat
+```json
+{
+  "action": "delete_chat",
+  "chatId": "uuid-here",
+  "password": "your-delete-password"
+}
+```
+
 ## DynamoDB Table Structure
 
 Table: `document_tables_memory`
@@ -115,6 +136,8 @@ Table: `document_tables_memory`
   "record_type": "document",
   "metadata": { "fileName": "...", "author": "...", ... },
   "content": "extracted text",
+  "s3Key": "documents/uuid/uuid.pdf",
+  "fileUrl": "https://... (presigned URL)",
   "embedding": { "model": "...", "vector": [...], ... },
   "createdAt": "ISO timestamp"
 }
@@ -140,12 +163,18 @@ Table: `document_tables_memory`
 2. Upload to your AWS Lambda function
 3. Set environment variables:
    - `DYNAMODB_TABLE`: `document_tables_memory` (default)
+   - `S3_BUCKET`: `memoryaitest` (default)
+   - `DELETE_PASSWORD`: your chosen password for delete operations
    - `AWS_REGION`: `us-east-1` (default)
-4. Ensure the Lambda execution role has DynamoDB read/write permissions for the table
+4. Ensure the Lambda execution role has:
+   - DynamoDB read/write permissions for the table
+   - S3 read/write permissions for the bucket (`s3:PutObject`, `s3:GetObject`, `s3:DeleteObject`)
 
 ## Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `DYNAMODB_TABLE` | `document_tables_memory` | DynamoDB table name |
+| `S3_BUCKET` | `memoryaitest` | S3 bucket for file storage |
+| `DELETE_PASSWORD` | `memory_ai_delete_2024` | Password for delete operations |
 | `AWS_REGION` | `us-east-1` | AWS region |
