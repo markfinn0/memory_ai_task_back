@@ -5,10 +5,16 @@ import base64
 import math
 import boto3
 import os
+import time
 from datetime import datetime
 from decimal import Decimal
-from botocore.config import Config
 from boto3.dynamodb.conditions import Attr
+
+try:
+    import requests as _requests
+except ImportError:
+    from urllib.request import Request, urlopen
+    _requests = None
 
 # ---------------------------------------------------------------------------
 # AWS clients & config
@@ -27,17 +33,16 @@ S3_BUCKET = os.environ.get("S3_BUCKET", "memoryaitest")
 
 DELETE_PASSWORD = os.environ.get("DELETE_PASSWORD", "memory_ai_delete_2024")
 
-# AWS Bedrock
-BEDROCK_EMBED_MODEL = os.environ.get("BEDROCK_EMBED_MODEL", "amazon.titan-embed-text-v2:0")
-BEDROCK_CHAT_MODEL = os.environ.get("BEDROCK_CHAT_MODEL", "us.anthropic.claude-haiku-4-5-20251001-v1:0")
-EMBEDDING_DIMENSIONS = 1024  # Titan V2 supports 256, 512, 1024
+# OpenAI
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+OPENAI_EMBED_MODEL = os.environ.get("OPENAI_EMBED_MODEL", "text-embedding-3-small")
+OPENAI_CHAT_MODEL = os.environ.get("OPENAI_CHAT_MODEL", "gpt-4o-mini")
+OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1")
+EMBEDDING_DIMENSIONS = 1536  # text-embedding-3-small default
 
-# Bedrock runtime client with adaptive retry (handles throttling automatically)
-_bedrock_config = Config(
-    retries={"max_attempts": 5, "mode": "adaptive"},
-    read_timeout=30,
-)
-bedrock_runtime = boto3.client("bedrock-runtime", region_name=REGION, config=_bedrock_config)
+# Retry config
+_MAX_RETRIES = int(os.environ.get("OPENAI_MAX_RETRIES", "3"))
+_RETRY_BACKOFF = 1  # seconds, doubles each retry
 
 # ElastiCache / Valkey (Redis-compatible, serverless with TLS)
 ELASTICACHE_HOST = os.environ.get(
@@ -169,33 +174,74 @@ def delete_s3_file(s3_key: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# AWS Bedrock helpers
+# OpenAI helpers
 # ---------------------------------------------------------------------------
 
 
+def _openai_request(endpoint: str, payload: dict, timeout: int = 30) -> dict:
+    """Make a POST request to the OpenAI API with retry logic."""
+    url = f"{OPENAI_BASE_URL}/{endpoint}"
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    last_exc = None
+    for attempt in range(_MAX_RETRIES):
+        try:
+            if _requests is not None:
+                resp = _requests.post(url, json=payload, headers=headers, timeout=timeout)
+                if resp.status_code == 429 or resp.status_code >= 500:
+                    wait = _RETRY_BACKOFF * (2 ** attempt)
+                    print(f"[openai] {resp.status_code} on attempt {attempt + 1}, retrying in {wait}s")
+                    time.sleep(wait)
+                    last_exc = Exception(f"HTTP {resp.status_code}: {resp.text}")
+                    continue
+                resp.raise_for_status()
+                return resp.json()
+            else:
+                # Fallback to urllib if requests is not available
+                data = json.dumps(payload).encode()
+                req = Request(url, data=data, headers=headers, method="POST")
+                with urlopen(req, timeout=timeout) as r:
+                    return json.loads(r.read())
+        except Exception as exc:
+            last_exc = exc
+            if attempt < _MAX_RETRIES - 1:
+                wait = _RETRY_BACKOFF * (2 ** attempt)
+                print(f"[openai] Error on attempt {attempt + 1}: {exc}, retrying in {wait}s")
+                time.sleep(wait)
+    raise last_exc
+
+
 def generate_embedding(text: str) -> list:
-    """Call AWS Bedrock Titan Embeddings and return a vector."""
+    """Call OpenAI Embeddings API and return a vector."""
+    if not OPENAI_API_KEY:
+        print("[embed] No OPENAI_API_KEY, returning empty vector")
+        return []
     try:
-        body = json.dumps({
-            "inputText": text[:8000],
-            "dimensions": EMBEDDING_DIMENSIONS,
-            "normalize": True,
+        result = _openai_request("embeddings", {
+            "input": text[:8000],
+            "model": OPENAI_EMBED_MODEL,
         })
-        resp = bedrock_runtime.invoke_model(
-            modelId=BEDROCK_EMBED_MODEL,
-            body=body,
-            contentType="application/json",
-            accept="application/json",
-        )
-        result = json.loads(resp["body"].read())
-        return result.get("embedding", [])
+        data = result.get("data", [])
+        if data:
+            return data[0].get("embedding", [])
+        return []
     except Exception as exc:
-        print(f"[embed] Bedrock embedding error: {exc}")
+        print(f"[embed] OpenAI embedding error: {exc}")
         return []
 
 
 def generate_ai_response(question: str, context_docs: list, chat_history: list) -> str:
-    """Call AWS Bedrock Claude via the Converse API to generate a chat answer."""
+    """Call OpenAI Chat Completions API to generate a chat answer."""
+    if not OPENAI_API_KEY:
+        return (
+            f'I received your question: "{question}". '
+            "However, the AI service is not configured yet. "
+            "Please set the OPENAI_API_KEY environment variable."
+        )
+
     ctx_parts = []
     for i, doc in enumerate(context_docs, 1):
         meta = doc.get("metadata", {})
@@ -224,31 +270,24 @@ def generate_ai_response(question: str, context_docs: list, chat_history: list) 
     if history_block:
         system_prompt += f"\nCHAT HISTORY:\n{history_block}\n"
 
-    # Build messages for Converse API
     messages = [
-        {
-            "role": "user",
-            "content": [{"text": question}],
-        }
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": question},
     ]
 
     try:
-        resp = bedrock_runtime.converse(
-            modelId=BEDROCK_CHAT_MODEL,
-            system=[{"text": system_prompt}],
-            messages=messages,
-            inferenceConfig={
-                "maxTokens": 1024,
-                "temperature": 0.7,
-            },
-        )
-        output_message = resp.get("output", {}).get("message", {})
-        content_blocks = output_message.get("content", [])
-        if content_blocks:
-            return content_blocks[0].get("text", "No response generated.")
+        result = _openai_request("chat/completions", {
+            "model": OPENAI_CHAT_MODEL,
+            "messages": messages,
+            "max_tokens": 1024,
+            "temperature": 0.7,
+        })
+        choices = result.get("choices", [])
+        if choices:
+            return choices[0].get("message", {}).get("content", "No response generated.")
         return "No response generated by the AI model."
     except Exception as exc:
-        print(f"[bedrock] Chat error: {exc}")
+        print(f"[openai] Chat error: {exc}")
         return f"I encountered an error while processing your question. Error: {exc}"
 
 
@@ -387,12 +426,12 @@ def upload_document(data: dict) -> dict:
     file_type = data.get("fileType", ".txt")
     content = data.get("content", "")
 
-    # Generate embedding via Bedrock
+    # Generate embedding via OpenAI
     embed_text = f"{data.get('context', '')} {data.get('fileName', '')} {content}"
     vector = generate_embedding(embed_text)
 
     embedding = {
-        "model": BEDROCK_EMBED_MODEL,
+        "model": OPENAI_EMBED_MODEL,
         "dimensions": EMBEDDING_DIMENSIONS,
         "vector": vector,
         "tokenCount": len(embed_text.split()),
