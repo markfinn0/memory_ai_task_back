@@ -3,6 +3,7 @@ import uuid
 import hashlib
 import base64
 import ssl
+import math
 import boto3
 import os
 from datetime import datetime
@@ -33,13 +34,6 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_EMBED_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-001:embedContent"
 GEMINI_CHAT_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
 EMBEDDING_DIMENSIONS = 768
-
-# OpenSearch
-OPENSEARCH_ENDPOINT = os.environ.get(
-    "OPENSEARCH_ENDPOINT",
-    "https://search-memoryai-ebj55yqzcpswtjpb6lzmuknanu.us-east-1.es.amazonaws.com",
-)
-OPENSEARCH_INDEX = os.environ.get("OPENSEARCH_INDEX", "documents")
 
 # ElastiCache / Valkey (Redis-compatible, serverless with TLS)
 ELASTICACHE_HOST = os.environ.get(
@@ -261,134 +255,69 @@ def generate_ai_response(question: str, context_docs: list, chat_history: list) 
 
 
 # ---------------------------------------------------------------------------
-# OpenSearch helpers
+# DynamoDB vector search helpers
 # ---------------------------------------------------------------------------
 
 
-def _os_request(method: str, path: str, body: dict = None) -> dict:
-    """Make a signed request to OpenSearch using IAM (SigV4)."""
-    from botocore.auth import SigV4Auth
-    from botocore.awsrequest import AWSRequest
-    import botocore.session
-
-    url = f"{OPENSEARCH_ENDPOINT}/{path}"
-    data = json.dumps(body).encode() if body else None
-    headers = {"Content-Type": "application/json"}
-
-    session = botocore.session.get_session()
-    credentials = session.get_credentials()
-    if credentials is None:
-        print("[opensearch] No AWS credentials for SigV4")
-        return {}
-    frozen = credentials.get_frozen_credentials()
-    aws_req = AWSRequest(method=method, url=url, data=data, headers=headers)
-    SigV4Auth(frozen, "es", REGION).add_auth(aws_req)
-
-    req = Request(url, data=data, method=method)
-    for k, v in dict(aws_req.headers).items():
-        req.add_header(k, v)
-
-    try:
-        with urlopen(req, timeout=10, context=_ssl_ctx) as resp:
-            return json.loads(resp.read())
-    except HTTPError as exc:
-        body_bytes = exc.read() if hasattr(exc, "read") else b""
-        print(f"[opensearch] {method} {path} -> {exc.code}: {body_bytes[:500]}")
-        return {"error": True, "status": exc.code, "body": body_bytes.decode("utf-8", errors="replace")}
-    except Exception as exc:
-        print(f"[opensearch] {method} {path} error: {exc}")
-        return {"error": True, "message": str(exc)}
-
-
-_os_index_checked = False
-
-
-def ensure_opensearch_index():
-    """Create the OpenSearch index with kNN mapping if it does not exist."""
-    global _os_index_checked
-    if _os_index_checked:
-        return
-    result = _os_request("GET", OPENSEARCH_INDEX)
-    if result.get("error") and result.get("status") == 404:
-        mapping = {
-            "settings": {"index": {"knn": True}},
-            "mappings": {
-                "properties": {
-                    "doc_id": {"type": "keyword"},
-                    "content": {"type": "text"},
-                    "context": {"type": "text"},
-                    "file_name": {"type": "keyword"},
-                    "author": {"type": "keyword"},
-                    "tags": {"type": "keyword"},
-                    "embedding": {
-                        "type": "knn_vector",
-                        "dimension": EMBEDDING_DIMENSIONS,
-                        "method": {
-                            "name": "hnsw",
-                            "engine": "nmslib",
-                            "space_type": "cosinesimil",
-                        },
-                    },
-                    "created_at": {"type": "date"},
-                },
-            },
-        }
-        res = _os_request("PUT", OPENSEARCH_INDEX, mapping)
-        print(f"[opensearch] Index created: {res}")
-    _os_index_checked = True
-
-
-def index_document_opensearch(doc_id: str, content: str, embedding: list, metadata: dict):
-    """Index a document in OpenSearch for semantic search."""
-    if not embedding:
-        print(f"[opensearch] Skipping index for {doc_id}: no embedding")
-        return
-    ensure_opensearch_index()
-    body = {
-        "doc_id": doc_id,
-        "content": content[:10000],
-        "context": metadata.get("context", ""),
-        "file_name": metadata.get("fileName", ""),
-        "author": metadata.get("author", ""),
-        "tags": metadata.get("tags", []),
-        "embedding": embedding,
-        "created_at": datetime.utcnow().isoformat(),
-    }
-    result = _os_request("PUT", f"{OPENSEARCH_INDEX}/_doc/{doc_id}", body)
-    print(f"[opensearch] Indexed {doc_id}: {result.get('result', result)}")
-
-
-def delete_document_opensearch(doc_id: str):
-    """Remove a document from OpenSearch."""
-    _os_request("DELETE", f"{OPENSEARCH_INDEX}/_doc/{doc_id}")
+def _cosine_similarity(vec_a: list, vec_b: list) -> float:
+    """Compute cosine similarity between two vectors."""
+    if len(vec_a) != len(vec_b) or not vec_a:
+        return 0.0
+    dot = sum(a * b for a, b in zip(vec_a, vec_b))
+    norm_a = math.sqrt(sum(a * a for a in vec_a))
+    norm_b = math.sqrt(sum(b * b for b in vec_b))
+    if norm_a == 0 or norm_b == 0:
+        return 0.0
+    return dot / (norm_a * norm_b)
 
 
 def semantic_search(query_embedding: list, k: int = 5) -> list:
-    """Perform kNN semantic search in OpenSearch."""
+    """Scan all documents in DynamoDB and rank by cosine similarity."""
     if not query_embedding:
         return []
-    body = {
-        "size": k,
-        "query": {"knn": {"embedding": {"vector": query_embedding, "k": k}}},
-        "_source": ["doc_id", "content", "context", "file_name", "author", "tags"],
-    }
-    result = _os_request("POST", f"{OPENSEARCH_INDEX}/_search", body)
-    hits = result.get("hits", {}).get("hits", [])
-    docs = []
-    for hit in hits:
-        src = hit.get("_source", {})
-        docs.append({
-            "doc_id": src.get("doc_id"),
-            "content": src.get("content", ""),
-            "score": hit.get("_score", 0),
+
+    # Convert query embedding floats for comparison
+    query_vec = [float(v) for v in query_embedding]
+
+    scan_kwargs = {"FilterExpression": Attr("record_type").eq("document")}
+    items = []
+    start_key = None
+    while True:
+        if start_key:
+            scan_kwargs["ExclusiveStartKey"] = start_key
+        resp = doc_table.scan(**scan_kwargs)
+        items.extend(resp.get("Items", []))
+        start_key = resp.get("LastEvaluatedKey")
+        if not start_key:
+            break
+
+    scored = []
+    for item in items:
+        embedding_data = item.get("embedding", {})
+        doc_vec = embedding_data.get("vector", [])
+        if not doc_vec:
+            continue
+        # Convert Decimal to float
+        doc_vec = [float(v) for v in doc_vec]
+        if len(doc_vec) != len(query_vec):
+            continue
+        score = _cosine_similarity(query_vec, doc_vec)
+        meta = item.get("metadata", {})
+        scored.append({
+            "doc_id": item.get("ID", ""),
+            "content": item.get("content", ""),
+            "score": round(score, 4),
             "metadata": {
-                "fileName": src.get("file_name", ""),
-                "author": src.get("author", ""),
-                "context": src.get("context", ""),
-                "tags": src.get("tags", []),
+                "fileName": meta.get("fileName", ""),
+                "author": meta.get("author", ""),
+                "context": meta.get("context", ""),
+                "tags": meta.get("tags", []),
             },
         })
-    return docs
+
+    # Sort by score descending and return top-k
+    scored.sort(key=lambda x: x["score"], reverse=True)
+    return scored[:k]
 
 
 # ---------------------------------------------------------------------------
@@ -449,7 +378,7 @@ def get_upload_presigned_url(data: dict) -> dict:
 
 
 def upload_document(data: dict) -> dict:
-    """Upload document: save metadata to DynamoDB, generate embedding, index in OpenSearch."""
+    """Upload document: save metadata and full embedding to DynamoDB."""
     required = ["fileName", "author", "context", "uploadedBy"]
     for field in required:
         if field not in data:
@@ -460,15 +389,14 @@ def upload_document(data: dict) -> dict:
     file_type = data.get("fileType", ".txt")
     content = data.get("content", "")
 
-    # Generate real embedding via Gemini
+    # Generate embedding via Gemini
     embed_text = f"{data.get('context', '')} {data.get('fileName', '')} {content}"
     vector = generate_embedding(embed_text)
 
     embedding = {
-        "model": "text-embedding-004",
+        "model": "gemini-embedding-001",
         "dimensions": EMBEDDING_DIMENSIONS,
-        "vector": vector[:20] if vector else [],
-        "fullVectorSize": len(vector),
+        "vector": vector,
         "tokenCount": len(embed_text.split()),
         "createdAt": now,
     }
@@ -505,12 +433,6 @@ def upload_document(data: dict) -> dict:
 
     item = convert_floats_to_decimal(item)
     doc_table.put_item(Item=item)
-
-    # Index in OpenSearch (non-fatal if it fails)
-    try:
-        index_document_opensearch(doc_id, content, vector, data)
-    except Exception as exc:
-        print(f"[upload] OpenSearch indexing failed (non-fatal): {exc}")
 
     result = convert_decimals_to_float(item)
     result.pop("deletePassword", None)
@@ -560,13 +482,13 @@ def search_documents(data: dict) -> dict:
     if not query:
         return get_documents(data)
 
-    # Try semantic search first via OpenSearch
+    # Try semantic search via DynamoDB cosine similarity
     query_vec = generate_embedding(query)
     if query_vec:
-        os_hits = semantic_search(query_vec, k=10)
-        if os_hits:
+        hits = semantic_search(query_vec, k=10)
+        if hits:
             results = []
-            for hit in os_hits:
+            for hit in hits:
                 did = hit.get("doc_id")
                 if not did:
                     continue
@@ -638,10 +560,6 @@ def delete_document(data: dict) -> dict:
     if "s3Key" in item:
         delete_s3_file(item["s3Key"])
     doc_table.delete_item(Key={"ID": doc_id})
-    try:
-        delete_document_opensearch(doc_id)
-    except Exception as exc:
-        print(f"[delete] OpenSearch removal failed (non-fatal): {exc}")
     return response(200, {"message": "Document deleted successfully", "documentId": doc_id})
 
 
@@ -751,7 +669,7 @@ def send_message(data: dict) -> dict:
         cached = True
         print("[chat] Cache HIT for question hash")
     else:
-        # Step 2: Semantic search in OpenSearch
+        # Step 2: Semantic search in DynamoDB
         query_vec = generate_embedding(message_content)
         context_docs = semantic_search(query_vec, k=5) if query_vec else []
         documents_used = [d.get("doc_id", "") for d in context_docs if d.get("doc_id")]
