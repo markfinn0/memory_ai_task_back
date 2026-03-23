@@ -168,10 +168,10 @@ Table: `document_tables_memory`
    - `DELETE_PASSWORD`: your chosen password for delete operations
    - `AWS_REGION`: `us-east-1` (default)
    - `BEDROCK_EMBED_MODEL`: `amazon.titan-embed-text-v2:0` (default)
-   - `BEDROCK_CHAT_MODEL`: `anthropic.claude-3-haiku-20240307-v1:0` (default)
+   - `BEDROCK_CHAT_MODEL`: `us.anthropic.claude-haiku-4-5-20251001-v1:0` (default)
 4. Enable model access in your AWS account:
    - Go to **Amazon Bedrock → Model access** in the AWS Console
-   - Request access for **Amazon Titan Text Embeddings V2** and your chosen **Anthropic Claude** model
+   - Request access for **Amazon Titan Text Embeddings V2** and **Anthropic Claude Haiku 4.5**
 5. Ensure the Lambda execution role has:
    - DynamoDB read/write permissions for the table
    - S3 read/write permissions for the bucket (`s3:PutObject`, `s3:GetObject`, `s3:DeleteObject`)
@@ -186,6 +186,6 @@ Table: `document_tables_memory`
 | `DELETE_PASSWORD` | `memory_ai_delete_2024` | Password for delete operations |
 | `AWS_REGION` | `us-east-1` | AWS region |
 | `BEDROCK_EMBED_MODEL` | `amazon.titan-embed-text-v2:0` | Bedrock embedding model ID |
-| `BEDROCK_CHAT_MODEL` | `anthropic.claude-3-haiku-20240307-v1:0` | Bedrock chat model ID |
+| `BEDROCK_CHAT_MODEL` | `us.anthropic.claude-haiku-4-5-20251001-v1:0` | Bedrock chat model ID (Converse API) |
 
 > **Note:** Embedding dimensions changed from 768 (Gemini) to 1024 (Titan V2). Existing documents must be re-uploaded to generate new embeddings compatible with the updated model.
