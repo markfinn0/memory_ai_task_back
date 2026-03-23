@@ -52,6 +52,13 @@ ELASTICACHE_HOST = os.environ.get(
 ELASTICACHE_PORT = int(os.environ.get("ELASTICACHE_PORT", "6379"))
 CACHE_TTL = int(os.environ.get("CACHE_TTL", "86400"))  # 1 day
 
+# Elasticsearch
+ELASTICSEARCH_HOST = os.environ.get("ELASTICSEARCH_HOST", "")
+ELASTICSEARCH_INDEX = os.environ.get("ELASTICSEARCH_INDEX", "memory_ai_interactions")
+
+# Similarity threshold: only send file content to AI when context score >= this
+SIMILARITY_THRESHOLD = float(os.environ.get("SIMILARITY_THRESHOLD", "0.3"))
+
 # ---------------------------------------------------------------------------
 # Lazy-initialised singletons
 # ---------------------------------------------------------------------------
@@ -358,7 +365,7 @@ def semantic_search(query_embedding: list, k: int = 5) -> list:
 
 
 # ---------------------------------------------------------------------------
-# ElastiCache / Valkey helpers
+# ElastiCache / Valkey helpers (legacy, used as fallback)
 # ---------------------------------------------------------------------------
 
 
@@ -367,7 +374,7 @@ def _cache_key(question: str) -> str:
 
 
 def get_cached_response(question: str):
-    """Look up a cached AI response by question hash."""
+    """Look up a cached AI response by question hash (Redis fallback)."""
     rc = _get_redis()
     if rc is None:
         return None
@@ -381,7 +388,7 @@ def get_cached_response(question: str):
 
 
 def cache_response(question: str, data: dict):
-    """Cache an AI response with TTL."""
+    """Cache an AI response with TTL (Redis fallback)."""
     rc = _get_redis()
     if rc is None:
         return
@@ -389,6 +396,118 @@ def cache_response(question: str, data: dict):
         rc.setex(_cache_key(question), CACHE_TTL, json.dumps(data, default=str))
     except Exception as exc:
         print(f"[cache] SET error: {exc}")
+
+
+# ---------------------------------------------------------------------------
+# Elasticsearch helpers
+# ---------------------------------------------------------------------------
+
+
+def _question_hash(question: str) -> str:
+    """Deterministic hash for a question string."""
+    return hashlib.sha256(question.strip().lower().encode()).hexdigest()
+
+
+def _es_request(method: str, path: str, body: dict = None, timeout: int = 10):
+    """Make an HTTP request to the Elasticsearch REST API."""
+    if not ELASTICSEARCH_HOST:
+        return None
+    url = f"{ELASTICSEARCH_HOST.rstrip('/')}{path}"
+    headers = {"Content-Type": "application/json"}
+    try:
+        if _requests is not None:
+            resp = _requests.request(
+                method, url, json=body, headers=headers, timeout=timeout,
+            )
+            if resp.status_code >= 400:
+                print(f"[elasticsearch] {method} {path} -> {resp.status_code}: {resp.text[:300]}")
+                return None
+            return resp.json()
+        else:
+            data = json.dumps(body).encode() if body else None
+            req = Request(url, data=data, headers=headers, method=method.upper())
+            with urlopen(req, timeout=timeout) as r:
+                return json.loads(r.read())
+    except Exception as exc:
+        print(f"[elasticsearch] {method} {path} error: {exc}")
+        return None
+
+
+_es_index_verified = False
+
+
+def _ensure_es_index():
+    """Create the Elasticsearch index if it does not exist (cached check)."""
+    global _es_index_verified
+    if not ELASTICSEARCH_HOST or _es_index_verified:
+        return
+    result = _es_request("GET", f"/{ELASTICSEARCH_INDEX}/_settings")
+    if result is None:
+        mapping = {
+            "mappings": {
+                "properties": {
+                    "question": {"type": "text"},
+                    "question_hash": {"type": "keyword"},
+                    "answer": {"type": "text"},
+                    "confidence": {"type": "float"},
+                    "documents_used": {"type": "keyword"},
+                    "chat_id": {"type": "keyword"},
+                    "created_at": {"type": "date"},
+                }
+            }
+        }
+        _es_request("PUT", f"/{ELASTICSEARCH_INDEX}", body=mapping)
+        print(f"[elasticsearch] Created index {ELASTICSEARCH_INDEX}")
+    _es_index_verified = True
+
+
+def save_to_elasticsearch(question: str, answer: str, confidence: float,
+                          documents_used: list, chat_id: str):
+    """Save an AI interaction (question + answer) to Elasticsearch."""
+    if not ELASTICSEARCH_HOST:
+        return
+    _ensure_es_index()
+    doc = {
+        "question": question,
+        "question_hash": _question_hash(question),
+        "answer": answer,
+        "confidence": confidence,
+        "documents_used": documents_used,
+        "chat_id": chat_id,
+        "created_at": datetime.utcnow().isoformat() + "Z",
+    }
+    result = _es_request("POST", f"/{ELASTICSEARCH_INDEX}/_doc", body=doc)
+    if result:
+        print(f"[elasticsearch] Saved interaction {result.get('_id', '?')}")
+
+
+def get_from_elasticsearch(question: str):
+    """Look up a cached AI response from Elasticsearch by question hash."""
+    if not ELASTICSEARCH_HOST:
+        return None
+    query = {
+        "query": {
+            "term": {
+                "question_hash": _question_hash(question)
+            }
+        },
+        "sort": [{"created_at": {"order": "desc"}}],
+        "size": 1,
+    }
+    result = _es_request("POST", f"/{ELASTICSEARCH_INDEX}/_search", body=query)
+    if not result:
+        return None
+    hits = result.get("hits", {})
+    total = hits.get("total", {})
+    count = total.get("value", 0) if isinstance(total, dict) else total
+    if count > 0 and hits.get("hits"):
+        src = hits["hits"][0]["_source"]
+        return {
+            "content": src.get("answer", ""),
+            "confidence": src.get("confidence", 0.95),
+            "documentsUsed": src.get("documents_used", []),
+        }
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -426,8 +545,10 @@ def upload_document(data: dict) -> dict:
     file_type = data.get("fileType", ".txt")
     content = data.get("content", "")
 
-    # Generate embedding via OpenAI
-    embed_text = f"{data.get('context', '')} {data.get('fileName', '')} {content}"
+    # Generate embedding based on CONTEXT only (not file content).
+    # The file content is stored separately and sent to AI only when context matches.
+    tags_text = " ".join(data.get("tags", []))
+    embed_text = f"{data.get('context', '')} {data.get('fileName', '')} {tags_text}"
     vector = generate_embedding(embed_text)
 
     embedding = {
@@ -696,37 +817,68 @@ def send_message(data: dict) -> dict:
     documents_used = []
     cached = False
 
-    # Step 1: Check ElastiCache / Valkey
-    cached_resp = get_cached_response(message_content)
-    if cached_resp:
-        ai_content = cached_resp["content"]
-        source_type = "reused"
-        confidence = cached_resp.get("confidence", 0.95)
-        documents_used = cached_resp.get("documentsUsed", [])
+    # Step 1: Check Elasticsearch for a previous identical question
+    es_resp = get_from_elasticsearch(message_content)
+    if es_resp:
+        ai_content = es_resp["content"]
+        source_type = "elasticsearch"
+        confidence = es_resp.get("confidence", 0.95)
+        documents_used = es_resp.get("documentsUsed", [])
         cached = True
-        print("[chat] Cache HIT for question hash")
+        print("[chat] Elasticsearch HIT for question hash")
     else:
-        # Step 2: Semantic search in DynamoDB
-        query_vec = generate_embedding(message_content)
-        context_docs = semantic_search(query_vec, k=5) if query_vec else []
-        documents_used = [d.get("doc_id", "") for d in context_docs if d.get("doc_id")]
-
-        if context_docs:
-            max_score = max(d.get("score", 0) for d in context_docs)
-            confidence = round(min(max_score, 1.0), 4)
+        # Step 1b: Fallback - check ElastiCache / Valkey (legacy)
+        cached_resp = get_cached_response(message_content)
+        if cached_resp:
+            ai_content = cached_resp["content"]
+            source_type = "elasticsearch"  # show as cached for the user
+            confidence = cached_resp.get("confidence", 0.95)
+            documents_used = cached_resp.get("documentsUsed", [])
+            cached = True
+            print("[chat] ElastiCache HIT for question hash (legacy)")
         else:
-            confidence = 0.5
+            # Step 2: Semantic search in DynamoDB (context-based embeddings)
+            query_vec = generate_embedding(message_content)
+            context_docs = semantic_search(query_vec, k=5) if query_vec else []
 
-        # Step 3: Generate answer via Gemini
-        ai_content = generate_ai_response(message_content, context_docs, messages[:-1])
+            # Filter documents by similarity threshold
+            # Only include file content for docs that truly match the context
+            relevant_docs = [
+                d for d in context_docs
+                if d.get("score", 0) >= SIMILARITY_THRESHOLD
+            ]
+            documents_used = [
+                d.get("doc_id", "") for d in relevant_docs if d.get("doc_id")
+            ]
 
-        # Step 4: Cache the response
-        cache_response(message_content, {
-            "content": ai_content,
-            "confidence": confidence,
-            "documentsUsed": documents_used,
-        })
-        print("[chat] Cache MISS - generated new response, cached it")
+            if relevant_docs:
+                max_score = max(d.get("score", 0) for d in relevant_docs)
+                confidence = round(min(max_score, 1.0), 4)
+            else:
+                confidence = 0.5
+
+            # Step 3: Generate answer via AI
+            # Pass relevant docs (with content) to AI only when context matches
+            ai_content = generate_ai_response(
+                message_content, relevant_docs, messages[:-1]
+            )
+
+            # Step 4: Save interaction to Elasticsearch
+            save_to_elasticsearch(
+                question=message_content,
+                answer=ai_content,
+                confidence=confidence,
+                documents_used=documents_used,
+                chat_id=chat_id,
+            )
+
+            # Step 4b: Also cache in ElastiCache (legacy fallback)
+            cache_response(message_content, {
+                "content": ai_content,
+                "confidence": confidence,
+                "documentsUsed": documents_used,
+            })
+            print("[chat] Cache MISS - generated new response, saved to Elasticsearch")
 
     ai_msg = {
         "id": str(uuid.uuid4()),
