@@ -433,11 +433,15 @@ def _es_request(method: str, path: str, body: dict = None, timeout: int = 10):
         return None
 
 
+_es_index_verified = False
+
+
 def _ensure_es_index():
-    """Create the Elasticsearch index if it does not exist."""
-    if not ELASTICSEARCH_HOST:
+    """Create the Elasticsearch index if it does not exist (cached check)."""
+    global _es_index_verified
+    if not ELASTICSEARCH_HOST or _es_index_verified:
         return
-    result = _es_request("HEAD", f"/{ELASTICSEARCH_INDEX}")
+    result = _es_request("GET", f"/{ELASTICSEARCH_INDEX}/_settings")
     if result is None:
         mapping = {
             "mappings": {
@@ -454,6 +458,7 @@ def _ensure_es_index():
         }
         _es_request("PUT", f"/{ELASTICSEARCH_INDEX}", body=mapping)
         print(f"[elasticsearch] Created index {ELASTICSEARCH_INDEX}")
+    _es_index_verified = True
 
 
 def save_to_elasticsearch(question: str, answer: str, confidence: float,
