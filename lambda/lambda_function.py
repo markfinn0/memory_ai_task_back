@@ -2,14 +2,12 @@ import json
 import uuid
 import hashlib
 import base64
-import ssl
 import math
 import boto3
 import os
 from datetime import datetime
 from decimal import Decimal
-from urllib.request import Request, urlopen
-from urllib.error import HTTPError
+from botocore.config import Config
 from boto3.dynamodb.conditions import Attr
 
 # ---------------------------------------------------------------------------
@@ -29,11 +27,17 @@ S3_BUCKET = os.environ.get("S3_BUCKET", "memoryaitest")
 
 DELETE_PASSWORD = os.environ.get("DELETE_PASSWORD", "memory_ai_delete_2024")
 
-# Gemini
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-GEMINI_EMBED_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-001:embedContent"
-GEMINI_CHAT_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
-EMBEDDING_DIMENSIONS = 768
+# AWS Bedrock
+BEDROCK_EMBED_MODEL = os.environ.get("BEDROCK_EMBED_MODEL", "amazon.titan-embed-text-v2:0")
+BEDROCK_CHAT_MODEL = os.environ.get("BEDROCK_CHAT_MODEL", "anthropic.claude-3-haiku-20240307-v1:0")
+EMBEDDING_DIMENSIONS = 1024  # Titan V2 supports 256, 512, 1024
+
+# Bedrock runtime client with adaptive retry (handles throttling automatically)
+_bedrock_config = Config(
+    retries={"max_attempts": 5, "mode": "adaptive"},
+    read_timeout=30,
+)
+bedrock_runtime = boto3.client("bedrock-runtime", region_name=REGION, config=_bedrock_config)
 
 # ElastiCache / Valkey (Redis-compatible, serverless with TLS)
 ELASTICACHE_HOST = os.environ.get(
@@ -127,8 +131,6 @@ MIME_MAP = {
     ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
 }
 
-_ssl_ctx = ssl.create_default_context()
-
 # ---------------------------------------------------------------------------
 # S3 helpers
 # ---------------------------------------------------------------------------
@@ -167,39 +169,33 @@ def delete_s3_file(s3_key: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Gemini helpers
+# AWS Bedrock helpers
 # ---------------------------------------------------------------------------
 
 
 def generate_embedding(text: str) -> list:
-    """Call Gemini gemini-embedding-001 and return a 768-d vector."""
-    if not GEMINI_API_KEY:
-        print("[embed] No GEMINI_API_KEY, returning empty vector")
-        return []
-    url = f"{GEMINI_EMBED_URL}?key={GEMINI_API_KEY}"
-    payload = json.dumps({
-        "content": {"parts": [{"text": text[:8000]}]},
-        "outputDimensionality": EMBEDDING_DIMENSIONS,
-    }).encode()
-    req = Request(url, data=payload, headers={"Content-Type": "application/json"}, method="POST")
+    """Call AWS Bedrock Titan Embeddings and return a vector."""
     try:
-        with urlopen(req, timeout=15, context=_ssl_ctx) as resp:
-            data = json.loads(resp.read())
-        return data.get("embedding", {}).get("values", [])
+        body = json.dumps({
+            "inputText": text[:8000],
+            "dimensions": EMBEDDING_DIMENSIONS,
+            "normalize": True,
+        })
+        resp = bedrock_runtime.invoke_model(
+            modelId=BEDROCK_EMBED_MODEL,
+            body=body,
+            contentType="application/json",
+            accept="application/json",
+        )
+        result = json.loads(resp["body"].read())
+        return result.get("embedding", [])
     except Exception as exc:
-        print(f"[embed] Gemini embedding error: {exc}")
+        print(f"[embed] Bedrock embedding error: {exc}")
         return []
 
 
 def generate_ai_response(question: str, context_docs: list, chat_history: list) -> str:
-    """Call Gemini to generate a chat answer given context documents."""
-    if not GEMINI_API_KEY:
-        return (
-            f'I received your question: "{question}". '
-            "However, the AI service is not configured yet. "
-            "Please set the GEMINI_API_KEY environment variable."
-        )
-
+    """Call AWS Bedrock Claude to generate a chat answer given context documents."""
     ctx_parts = []
     for i, doc in enumerate(context_docs, 1):
         meta = doc.get("metadata", {})
@@ -228,29 +224,30 @@ def generate_ai_response(question: str, context_docs: list, chat_history: list) 
     if history_block:
         system_prompt += f"\nCHAT HISTORY:\n{history_block}\n"
 
-    url = f"{GEMINI_CHAT_URL}?key={GEMINI_API_KEY}"
-    payload = json.dumps({
-        "contents": [
-            {"role": "user", "parts": [{"text": system_prompt + "\n\nQuestion: " + question}]},
-        ],
-        "generationConfig": {
-            "temperature": 0.7,
-            "maxOutputTokens": 1024,
-        },
-    }).encode()
+    # Build messages for Claude
+    messages = [{"role": "user", "content": question}]
 
-    req = Request(url, data=payload, headers={"Content-Type": "application/json"}, method="POST")
     try:
-        with urlopen(req, timeout=30, context=_ssl_ctx) as resp:
-            data = json.loads(resp.read())
-        candidates = data.get("candidates", [])
-        if candidates:
-            parts = candidates[0].get("content", {}).get("parts", [])
-            if parts:
-                return parts[0].get("text", "No response generated.")
+        body = json.dumps({
+            "anthropic_version": "bedrock-2023-05-31",
+            "max_tokens": 1024,
+            "temperature": 0.7,
+            "system": system_prompt,
+            "messages": messages,
+        })
+        resp = bedrock_runtime.invoke_model(
+            modelId=BEDROCK_CHAT_MODEL,
+            body=body,
+            contentType="application/json",
+            accept="application/json",
+        )
+        result = json.loads(resp["body"].read())
+        content_blocks = result.get("content", [])
+        if content_blocks:
+            return content_blocks[0].get("text", "No response generated.")
         return "No response generated by the AI model."
     except Exception as exc:
-        print(f"[gemini] Chat error: {exc}")
+        print(f"[bedrock] Chat error: {exc}")
         return f"I encountered an error while processing your question. Error: {exc}"
 
 
@@ -389,12 +386,12 @@ def upload_document(data: dict) -> dict:
     file_type = data.get("fileType", ".txt")
     content = data.get("content", "")
 
-    # Generate embedding via Gemini
+    # Generate embedding via Bedrock
     embed_text = f"{data.get('context', '')} {data.get('fileName', '')} {content}"
     vector = generate_embedding(embed_text)
 
     embedding = {
-        "model": "gemini-embedding-001",
+        "model": BEDROCK_EMBED_MODEL,
         "dimensions": EMBEDDING_DIMENSIONS,
         "vector": vector,
         "tokenCount": len(embed_text.split()),
