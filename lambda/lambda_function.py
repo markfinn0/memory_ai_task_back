@@ -6,6 +6,7 @@ import math
 import boto3
 import os
 import time
+import io
 from datetime import datetime
 from decimal import Decimal
 from boto3.dynamodb.conditions import Attr
@@ -16,6 +17,16 @@ except ImportError:
     from urllib.request import Request, urlopen
     _requests = None
 
+try:
+    import pdfplumber as _pdfplumber
+except ImportError:
+    _pdfplumber = None
+
+try:
+    import docx as _docx
+except ImportError:
+    _docx = None
+
 # ---------------------------------------------------------------------------
 # AWS clients & config
 # ---------------------------------------------------------------------------
@@ -25,8 +36,10 @@ REGION = os.environ.get("AWS_REGION", "us-east-1")
 dynamodb = boto3.resource("dynamodb", region_name=REGION)
 DOC_TABLE_NAME = os.environ.get("DYNAMODB_TABLE", "document_tables_memory")
 CHAT_TABLE_NAME = os.environ.get("CHAT_TABLE", "chat_memory_user")
+SEARCH_TABLE_NAME = os.environ.get("SEARCH_TABLE", "tabela_search")
 doc_table = dynamodb.Table(DOC_TABLE_NAME)
 chat_table = dynamodb.Table(CHAT_TABLE_NAME)
+search_table = dynamodb.Table(SEARCH_TABLE_NAME)
 
 s3 = boto3.client("s3", region_name=REGION)
 S3_BUCKET = os.environ.get("S3_BUCKET", "memoryaitest")
@@ -58,6 +71,9 @@ ELASTICSEARCH_INDEX = os.environ.get("ELASTICSEARCH_INDEX", "memory_ai_interacti
 
 # Similarity threshold: only send file content to AI when context score >= this
 SIMILARITY_THRESHOLD = float(os.environ.get("SIMILARITY_THRESHOLD", "0.3"))
+
+# Threshold for reusing cached answers from tabela_search
+SEARCH_CACHE_THRESHOLD = float(os.environ.get("SEARCH_CACHE_THRESHOLD", "0.85"))
 
 # ---------------------------------------------------------------------------
 # Lazy-initialised singletons
@@ -178,6 +194,79 @@ def delete_s3_file(s3_key: str) -> None:
         s3.delete_object(Bucket=S3_BUCKET, Key=s3_key)
     except Exception as e:
         print(f"Warning: Failed to delete S3 object {s3_key}: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Document content extraction helpers
+# ---------------------------------------------------------------------------
+
+
+def _decode_file_data_url(file_data_url: str) -> bytes:
+    """Decode a base64 data-URL (or raw base64) into bytes."""
+    if "," in file_data_url:
+        _, encoded = file_data_url.split(",", 1)
+    else:
+        encoded = file_data_url
+    return base64.b64decode(encoded)
+
+
+def extract_text_from_pdf(file_bytes: bytes) -> str:
+    """Extract text from PDF bytes using pdfplumber."""
+    if _pdfplumber is None:
+        print("[extract] pdfplumber not available, skipping PDF extraction")
+        return ""
+    try:
+        text_parts = []
+        with _pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+            for page in pdf.pages:
+                page_text = page.extract_text()
+                if page_text:
+                    text_parts.append(page_text)
+        extracted = "\n".join(text_parts)
+        print(f"[extract] PDF: extracted {len(extracted)} chars from {len(text_parts)} pages")
+        return extracted
+    except Exception as exc:
+        print(f"[extract] PDF extraction error: {exc}")
+        return ""
+
+
+def extract_text_from_docx(file_bytes: bytes) -> str:
+    """Extract text from DOCX bytes using python-docx."""
+    if _docx is None:
+        print("[extract] python-docx not available, skipping DOCX extraction")
+        return ""
+    try:
+        doc = _docx.Document(io.BytesIO(file_bytes))
+        text_parts = [para.text for para in doc.paragraphs if para.text.strip()]
+        extracted = "\n".join(text_parts)
+        print(f"[extract] DOCX: extracted {len(extracted)} chars from {len(text_parts)} paragraphs")
+        return extracted
+    except Exception as exc:
+        print(f"[extract] DOCX extraction error: {exc}")
+        return ""
+
+
+def extract_text_from_file(file_data_url: str, file_type: str) -> str:
+    """Extract readable text content from a file based on its type.
+
+    Supports PDF (.pdf) and Word (.docx) files.
+    For other types, returns empty string (caller should use the raw content field).
+    """
+    if not file_data_url:
+        return ""
+    file_bytes = _decode_file_data_url(file_data_url)
+    file_type_lower = file_type.lower()
+    if file_type_lower == ".pdf":
+        return extract_text_from_pdf(file_bytes)
+    if file_type_lower in (".docx",):
+        return extract_text_from_docx(file_bytes)
+    # For plain text types, decode as UTF-8
+    if file_type_lower in (".txt", ".csv", ".json", ".xml"):
+        try:
+            return file_bytes.decode("utf-8", errors="replace")
+        except Exception:
+            return ""
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -511,6 +600,109 @@ def get_from_elasticsearch(question: str):
 
 
 # ---------------------------------------------------------------------------
+# tabela_search helpers (DynamoDB-based AI response cache)
+# ---------------------------------------------------------------------------
+
+
+def save_to_search_table(question: str, answer: str, question_embedding: list,
+                         confidence: float, documents_used: list, chat_id: str):
+    """Save an AI interaction to the tabela_search DynamoDB table."""
+    try:
+        item = {
+            "id": str(uuid.uuid4()),
+            "question": question,
+            "question_hash": _question_hash(question),
+            "answer": answer,
+            "confidence": confidence,
+            "documents_used": documents_used,
+            "chat_id": chat_id,
+            "created_at": datetime.utcnow().isoformat() + "Z",
+        }
+        if question_embedding:
+            item["embedding"] = {
+                "model": OPENAI_EMBED_MODEL,
+                "dimensions": EMBEDDING_DIMENSIONS,
+                "vector": question_embedding,
+            }
+        item = convert_floats_to_decimal(item)
+        search_table.put_item(Item=item)
+        print(f"[tabela_search] Saved interaction {item['id']}")
+    except Exception as exc:
+        print(f"[tabela_search] Error saving: {exc}")
+
+
+def search_in_search_table(question: str, question_embedding: list):
+    """Search tabela_search for a cached AI response.
+
+    First tries exact match by question hash, then falls back to
+    semantic similarity search using embeddings.
+    Returns a dict with content/confidence/documentsUsed or None.
+    """
+    # --- Exact match by question hash ---
+    q_hash = _question_hash(question)
+    try:
+        scan_resp = search_table.scan(
+            FilterExpression=Attr("question_hash").eq(q_hash),
+            Limit=1,
+        )
+        items = scan_resp.get("Items", [])
+        if items:
+            src = items[0]
+            print(f"[tabela_search] Exact hash HIT: {src.get('id')}")
+            return {
+                "content": src.get("answer", ""),
+                "confidence": float(src.get("confidence", 0.95)),
+                "documentsUsed": src.get("documents_used", []),
+            }
+    except Exception as exc:
+        print(f"[tabela_search] Hash lookup error: {exc}")
+
+    # --- Semantic similarity search ---
+    if not question_embedding:
+        return None
+    query_vec = [float(v) for v in question_embedding]
+    try:
+        all_items = []
+        start_key = None
+        while True:
+            scan_kwargs = {}
+            if start_key:
+                scan_kwargs["ExclusiveStartKey"] = start_key
+            resp = search_table.scan(**scan_kwargs)
+            all_items.extend(resp.get("Items", []))
+            start_key = resp.get("LastEvaluatedKey")
+            if not start_key:
+                break
+
+        best_score = 0.0
+        best_item = None
+        for item in all_items:
+            emb = item.get("embedding", {})
+            item_vec = emb.get("vector", [])
+            if not item_vec:
+                continue
+            item_vec = [float(v) for v in item_vec]
+            if len(item_vec) != len(query_vec):
+                continue
+            score = _cosine_similarity(query_vec, item_vec)
+            if score > best_score:
+                best_score = score
+                best_item = item
+
+        if best_item and best_score >= SEARCH_CACHE_THRESHOLD:
+            print(f"[tabela_search] Semantic HIT: {best_item.get('id')} score={best_score:.4f}")
+            return {
+                "content": best_item.get("answer", ""),
+                "confidence": round(best_score, 4),
+                "documentsUsed": best_item.get("documents_used", []),
+            }
+        print(f"[tabela_search] No match above threshold (best={best_score:.4f})")
+    except Exception as exc:
+        print(f"[tabela_search] Semantic search error: {exc}")
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Document actions
 # ---------------------------------------------------------------------------
 
@@ -534,7 +726,7 @@ def get_upload_presigned_url(data: dict) -> dict:
 
 
 def upload_document(data: dict) -> dict:
-    """Upload document: save metadata and full embedding to DynamoDB."""
+    """Upload document: extract text content, save metadata and embedding to DynamoDB."""
     required = ["fileName", "author", "context", "uploadedBy"]
     for field in required:
         if field not in data:
@@ -545,10 +737,22 @@ def upload_document(data: dict) -> dict:
     file_type = data.get("fileType", ".txt")
     content = data.get("content", "")
 
-    # Generate embedding based on CONTEXT only (not file content).
-    # The file content is stored separately and sent to AI only when context matches.
+    # Extract real text content from the uploaded file (PDF, DOCX, etc.)
+    # instead of storing raw base64 data which has no value for AI.
+    file_data_url = data.get("fileDataUrl", "")
+    if file_data_url and file_type.lower() in (".pdf", ".docx", ".txt", ".csv", ".json", ".xml"):
+        extracted_text = extract_text_from_file(file_data_url, file_type)
+        if extracted_text:
+            content = extracted_text
+            print(f"[upload] Extracted {len(content)} chars from {file_type} file")
+
+    # Generate embedding based on extracted content + context + metadata
+    # so semantic search can find documents by their actual content.
     tags_text = " ".join(data.get("tags", []))
     embed_text = f"{data.get('context', '')} {data.get('fileName', '')} {tags_text}"
+    if content:
+        # Include a portion of the extracted content in the embedding
+        embed_text += f" {content[:4000]}"
     vector = generate_embedding(embed_text)
 
     embedding = {
@@ -581,8 +785,8 @@ def upload_document(data: dict) -> dict:
     if "s3Key" in data and data["s3Key"]:
         item["s3Key"] = data["s3Key"]
         item["fileUrl"] = get_s3_presigned_url(data["s3Key"])
-    elif "fileDataUrl" in data and data["fileDataUrl"]:
-        s3_key = upload_file_to_s3(doc_id, data["fileDataUrl"], file_type)
+    elif file_data_url:
+        s3_key = upload_file_to_s3(doc_id, file_data_url, file_type)
         item["s3Key"] = s3_key
         item["fileUrl"] = get_s3_presigned_url(s3_key)
 
@@ -783,7 +987,14 @@ def get_chat(data: dict) -> dict:
 
 
 def send_message(data: dict) -> dict:
-    """Memory-augmented chat: cache -> semantic search -> Gemini -> cache."""
+    """Memory-augmented chat: tabela_search -> document context -> AI -> save.
+
+    Flow (transparent to user via source field):
+    1. Check tabela_search for a cached/similar previous AI response
+    2. If no cache hit, search documents for related content
+    3. Generate new AI response with document context (if any)
+    4. Save the new response to tabela_search for future reuse
+    """
     chat_id = data.get("chatid")
     message_content = data.get("message")
     author_token = data.get("authorToken")
@@ -817,68 +1028,70 @@ def send_message(data: dict) -> dict:
     documents_used = []
     cached = False
 
-    # Step 1: Check Elasticsearch for a previous identical question
-    es_resp = get_from_elasticsearch(message_content)
-    if es_resp:
-        ai_content = es_resp["content"]
-        source_type = "elasticsearch"
-        confidence = es_resp.get("confidence", 0.95)
-        documents_used = es_resp.get("documentsUsed", [])
+    # Generate embedding for the question (used by both search steps)
+    query_vec = generate_embedding(message_content)
+
+    # Step 1: Check tabela_search for a cached/similar previous AI response
+    search_resp = search_in_search_table(message_content, query_vec)
+    if search_resp:
+        ai_content = search_resp["content"]
+        source_type = "tabela_search"
+        confidence = search_resp.get("confidence", 0.95)
+        documents_used = search_resp.get("documentsUsed", [])
         cached = True
-        print("[chat] Elasticsearch HIT for question hash")
+        print("[chat] tabela_search HIT - reusing cached response")
     else:
-        # Step 1b: Fallback - check ElastiCache / Valkey (legacy)
-        cached_resp = get_cached_response(message_content)
-        if cached_resp:
-            ai_content = cached_resp["content"]
-            source_type = "elasticsearch"  # show as cached for the user
-            confidence = cached_resp.get("confidence", 0.95)
-            documents_used = cached_resp.get("documentsUsed", [])
-            cached = True
-            print("[chat] ElastiCache HIT for question hash (legacy)")
+        # Step 2: Search documents for related content
+        context_docs = semantic_search(query_vec, k=5) if query_vec else []
+
+        # Filter documents by similarity threshold
+        relevant_docs = [
+            d for d in context_docs
+            if d.get("score", 0) >= SIMILARITY_THRESHOLD
+        ]
+        documents_used = [
+            d.get("doc_id", "") for d in relevant_docs if d.get("doc_id")
+        ]
+
+        if relevant_docs:
+            max_score = max(d.get("score", 0) for d in relevant_docs)
+            confidence = round(min(max_score, 1.0), 4)
+            source_type = "document_context"
+            print(f"[chat] Found {len(relevant_docs)} relevant documents (best score={max_score:.4f})")
         else:
-            # Step 2: Semantic search in DynamoDB (context-based embeddings)
-            query_vec = generate_embedding(message_content)
-            context_docs = semantic_search(query_vec, k=5) if query_vec else []
+            confidence = 0.5
+            source_type = "new"
+            print("[chat] No relevant documents found, generating without context")
 
-            # Filter documents by similarity threshold
-            # Only include file content for docs that truly match the context
-            relevant_docs = [
-                d for d in context_docs
-                if d.get("score", 0) >= SIMILARITY_THRESHOLD
-            ]
-            documents_used = [
-                d.get("doc_id", "") for d in relevant_docs if d.get("doc_id")
-            ]
+        # Step 3: Generate answer via AI with document context (if any)
+        ai_content = generate_ai_response(
+            message_content, relevant_docs, messages[:-1]
+        )
 
-            if relevant_docs:
-                max_score = max(d.get("score", 0) for d in relevant_docs)
-                confidence = round(min(max_score, 1.0), 4)
-            else:
-                confidence = 0.5
+        # Step 4: Save the new response to tabela_search for future reuse
+        save_to_search_table(
+            question=message_content,
+            answer=ai_content,
+            question_embedding=query_vec,
+            confidence=confidence,
+            documents_used=documents_used,
+            chat_id=chat_id,
+        )
 
-            # Step 3: Generate answer via AI
-            # Pass relevant docs (with content) to AI only when context matches
-            ai_content = generate_ai_response(
-                message_content, relevant_docs, messages[:-1]
-            )
-
-            # Step 4: Save interaction to Elasticsearch
-            save_to_elasticsearch(
-                question=message_content,
-                answer=ai_content,
-                confidence=confidence,
-                documents_used=documents_used,
-                chat_id=chat_id,
-            )
-
-            # Step 4b: Also cache in ElastiCache (legacy fallback)
-            cache_response(message_content, {
-                "content": ai_content,
-                "confidence": confidence,
-                "documentsUsed": documents_used,
-            })
-            print("[chat] Cache MISS - generated new response, saved to Elasticsearch")
+        # Also save to Elasticsearch and ElastiCache (legacy, if configured)
+        save_to_elasticsearch(
+            question=message_content,
+            answer=ai_content,
+            confidence=confidence,
+            documents_used=documents_used,
+            chat_id=chat_id,
+        )
+        cache_response(message_content, {
+            "content": ai_content,
+            "confidence": confidence,
+            "documentsUsed": documents_used,
+        })
+        print("[chat] New response saved to tabela_search")
 
     ai_msg = {
         "id": str(uuid.uuid4()),
