@@ -408,14 +408,22 @@ def _cosine_similarity(vec_a: list, vec_b: list) -> float:
 
 
 def semantic_search(query_embedding: list, k: int = 5) -> list:
-    """Scan all documents in DynamoDB and rank by cosine similarity."""
+    """Scan all documents in DynamoDB and rank by cosine similarity.
+
+    Uses ProjectionExpression to avoid downloading large content fields
+    during the scan. Full content is fetched only for the top-k matches.
+    """
     if not query_embedding:
         return []
 
     # Convert query embedding floats for comparison
     query_vec = [float(v) for v in query_embedding]
 
-    scan_kwargs = {"FilterExpression": Attr("record_type").eq("document")}
+    # Only fetch fields needed for similarity comparison (skip large content)
+    scan_kwargs = {
+        "FilterExpression": Attr("record_type").eq("document"),
+        "ProjectionExpression": "ID, embedding, metadata",
+    }
     items = []
     start_key = None
     while True:
@@ -441,7 +449,6 @@ def semantic_search(query_embedding: list, k: int = 5) -> list:
         meta = item.get("metadata", {})
         scored.append({
             "doc_id": item.get("ID", ""),
-            "content": item.get("content", ""),
             "score": round(score, 4),
             "metadata": {
                 "fileName": meta.get("fileName", ""),
@@ -451,9 +458,26 @@ def semantic_search(query_embedding: list, k: int = 5) -> list:
             },
         })
 
-    # Sort by score descending and return top-k
+    # Sort by score descending and keep top-k
     scored.sort(key=lambda x: x["score"], reverse=True)
-    return scored[:k]
+    top_results = scored[:k]
+
+    # Fetch full content only for matched documents
+    for result in top_results:
+        doc_id = result.get("doc_id")
+        if doc_id:
+            try:
+                full_doc = doc_table.get_item(
+                    Key={"ID": doc_id},
+                    ProjectionExpression="content",
+                )
+                result["content"] = full_doc.get("Item", {}).get("content", "")
+            except Exception:
+                result["content"] = ""
+        else:
+            result["content"] = ""
+
+    return top_results
 
 
 # ---------------------------------------------------------------------------
@@ -675,10 +699,13 @@ def search_in_search_table(question: str, question_embedding: list):
         return None
     query_vec = [float(v) for v in question_embedding]
     try:
+        # Only fetch id and embedding for comparison (skip large answer text)
         all_items = []
         start_key = None
         while True:
-            scan_kwargs = {}
+            scan_kwargs = {
+                "ProjectionExpression": "id, embedding",
+            }
             if start_key:
                 scan_kwargs["ExclusiveStartKey"] = start_key
             resp = search_table.scan(**scan_kwargs)
@@ -688,7 +715,7 @@ def search_in_search_table(question: str, question_embedding: list):
                 break
 
         best_score = 0.0
-        best_item = None
+        best_id = None
         for item in all_items:
             emb = item.get("embedding", {})
             item_vec = emb.get("vector", [])
@@ -700,14 +727,16 @@ def search_in_search_table(question: str, question_embedding: list):
             score = _cosine_similarity(query_vec, item_vec)
             if score > best_score:
                 best_score = score
-                best_item = item
+                best_id = item.get("id")
 
-        if best_item and best_score >= SEARCH_CACHE_THRESHOLD:
-            print(f"[tabela_search] Semantic HIT: {best_item.get('id')} score={best_score:.4f}")
+        if best_id and best_score >= SEARCH_CACHE_THRESHOLD:
+            # Fetch the full item only for the best match
+            full_item = search_table.get_item(Key={"id": best_id}).get("Item", {})
+            print(f"[tabela_search] Semantic HIT: {best_id} score={best_score:.4f}")
             return {
-                "content": best_item.get("answer", ""),
+                "content": full_item.get("answer", ""),
                 "confidence": round(best_score, 4),
-                "documentsUsed": best_item.get("documents_used", []),
+                "documentsUsed": full_item.get("documents_used", []),
             }
         print(f"[tabela_search] No match above threshold (best={best_score:.4f})")
     except Exception as exc:
