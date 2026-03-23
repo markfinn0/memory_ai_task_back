@@ -75,6 +75,9 @@ SIMILARITY_THRESHOLD = float(os.environ.get("SIMILARITY_THRESHOLD", "0.3"))
 # Threshold for reusing cached answers from tabela_search
 SEARCH_CACHE_THRESHOLD = float(os.environ.get("SEARCH_CACHE_THRESHOLD", "0.85"))
 
+# Max chars of extracted content to store in DynamoDB (to stay under 400KB item limit)
+MAX_CONTENT_CHARS = int(os.environ.get("MAX_CONTENT_CHARS", "100000"))
+
 # ---------------------------------------------------------------------------
 # Lazy-initialised singletons
 # ---------------------------------------------------------------------------
@@ -641,11 +644,21 @@ def search_in_search_table(question: str, question_embedding: list):
     # --- Exact match by question hash ---
     q_hash = _question_hash(question)
     try:
-        scan_resp = search_table.scan(
-            FilterExpression=Attr("question_hash").eq(q_hash),
-            Limit=1,
-        )
-        items = scan_resp.get("Items", [])
+        items = []
+        start_key = None
+        while True:
+            scan_kwargs = {
+                "FilterExpression": Attr("question_hash").eq(q_hash),
+            }
+            if start_key:
+                scan_kwargs["ExclusiveStartKey"] = start_key
+            scan_resp = search_table.scan(**scan_kwargs)
+            items.extend(scan_resp.get("Items", []))
+            if items:
+                break
+            start_key = scan_resp.get("LastEvaluatedKey")
+            if not start_key:
+                break
         if items:
             src = items[0]
             print(f"[tabela_search] Exact hash HIT: {src.get('id')}")
@@ -743,6 +756,10 @@ def upload_document(data: dict) -> dict:
     if file_data_url and file_type.lower() in (".pdf", ".docx", ".txt", ".csv", ".json", ".xml"):
         extracted_text = extract_text_from_file(file_data_url, file_type)
         if extracted_text:
+            # Truncate to stay within DynamoDB 400KB item size limit
+            if len(extracted_text) > MAX_CONTENT_CHARS:
+                print(f"[upload] Truncating content from {len(extracted_text)} to {MAX_CONTENT_CHARS} chars")
+                extracted_text = extracted_text[:MAX_CONTENT_CHARS]
             content = extracted_text
             print(f"[upload] Extracted {len(content)} chars from {file_type} file")
 
